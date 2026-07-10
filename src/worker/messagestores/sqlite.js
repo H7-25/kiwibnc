@@ -21,25 +21,25 @@ class SqliteMessageStore {
 
         const configuredStartupDelay =
             Number(loggingConf.retention_cleanup_startup_delay);
-        
+
         const configuredBatchSize =
             Number(loggingConf.retention_cleanup_batch_size);
-        
+
         const configuredMaxRows =
             Number(loggingConf.retention_cleanup_max_rows);
-        
+
         this.retentionCleanupStartupDelay =
             Number.isFinite(configuredStartupDelay) &&
             configuredStartupDelay >= 0
                 ? configuredStartupDelay
                 : 300;
-        
+
         this.retentionCleanupBatchSize =
             Number.isFinite(configuredBatchSize) &&
             configuredBatchSize > 0
                 ? configuredBatchSize
                 : 5000;
-        
+
         this.retentionCleanupMaxRows =
             Number.isFinite(configuredMaxRows) &&
             configuredMaxRows >= 0
