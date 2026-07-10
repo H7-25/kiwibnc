@@ -21,30 +21,25 @@ class SqliteMessageStore {
 
         const configuredStartupDelay =
             Number(loggingConf.retention_cleanup_startup_delay);
-
+        
         const configuredBatchSize =
             Number(loggingConf.retention_cleanup_batch_size);
-
+        
         const configuredMaxRows =
             Number(loggingConf.retention_cleanup_max_rows);
-
-        // Delay before the first cleanup after startup, in seconds.
-        // Zero means no delay.
+        
         this.retentionCleanupStartupDelay =
             Number.isFinite(configuredStartupDelay) &&
             configuredStartupDelay >= 0
                 ? configuredStartupDelay
                 : 300;
-
-        // Number of messages deleted in each SQLite transaction.
+        
         this.retentionCleanupBatchSize =
             Number.isFinite(configuredBatchSize) &&
             configuredBatchSize > 0
                 ? configuredBatchSize
                 : 5000;
-
-        // Maximum rows removed for each retention category during one run.
-        // Zero means unlimited.
+        
         this.retentionCleanupMaxRows =
             Number.isFinite(configuredMaxRows) &&
             configuredMaxRows >= 0
@@ -727,8 +722,9 @@ class SqliteMessageStore {
             message.params[1] && message.params[1][0] === '\x01'
         ) {
             // We do want to log ACTIONs though
-            if (!message.params[1].startsWith('\x01ACTION' )) {
+            if (!message.params[1].startsWith('\x01ACTION')) {
                 this.storeQueueLooping = false;
+                this.storeMessageLoop();
                 return;
             }
         }
@@ -750,6 +746,7 @@ class SqliteMessageStore {
 
         if (!type) {
             this.storeQueueLooping = false;
+            this.storeMessageLoop();
             return;
         }
 
@@ -798,7 +795,7 @@ function dbRowsToMessage(rows) {
         } else if (row.type === MSG_TYPE_NOTICE) {
             m.command = 'NOTICE';
         } else {
-            l.error('Read message from SQLite with unknown command:', m.type);
+            l.error('Read message from SQLite with unknown command:', row.type);
         }
 
         m.prefix = row.prefix;
