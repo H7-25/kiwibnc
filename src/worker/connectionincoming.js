@@ -92,7 +92,10 @@ class ConnectionIncoming {
         }
 
         this.conDict.delete(this.id);
-        this.state.destroy();
+        // state.destroy() is async, so a failed delete would be an unhandled rejection
+        this.state.destroy().catch((err) => {
+            l.error(`Error deleting connection state ${this.id}:`, err.message);
+        });
     }
 
     close() {
@@ -642,6 +645,15 @@ class ConnectionIncoming {
             network = await this.userDb.getNetwork(this.state.authNetworkId);
         }
 
+        // The network may have been deleted since this connection state was saved. Without this
+        // check we throw further down and, as most callers don't await us, that becomes an
+        // unhandled rejection that takes the whole worker down.
+        if (!network) {
+            l.error(`Network ${this.state.authNetworkId} no longer exists, not making an upstream connection`);
+            this.writeStatus('The network you were attached to no longer exists');
+            return null;
+        }
+
         let con = this.upstream || new ConnectionOutgoing(null, this.db, this.messages, this.queue, this.conDict);
         con.state.authUserId = network.user_id;
         con.state.setNetwork(network);
@@ -669,19 +681,24 @@ class ConnectionIncoming {
     }
 
     async onClientClosed() {
-        let upstream = this.upstream;
-        if (upstream && upstream.state.netRegistered) {
-            // If there are no other clients connected, mark this user as away
-            let otherClients = [];
-            upstream.forEachClient(c => otherClients.push(c), this);
-            if (otherClients.length === 0) {
-                upstream.writeLine('AWAY', 'away');
-                await upstream.state.tempSet('set_away', true);
+        // destroy() must run even if the awaits below reject, otherwise this connection stays
+        // in conDict and in the upstream's linkedIncomingConIds until the next worker restart
+        try {
+            let upstream = this.upstream;
+            if (upstream && upstream.state.netRegistered) {
+                // If there are no other clients connected, mark this user as away
+                let otherClients = [];
+                upstream.forEachClient(c => otherClients.push(c), this);
+                if (otherClients.length === 0) {
+                    upstream.writeLine('AWAY', 'away');
+                    await upstream.state.tempSet('set_away', true);
+                }
             }
-        }
 
-        await hooks.emit('client_disconnected', {client: this});
-        this.destroy();
+            await hooks.emit('client_disconnected', {client: this});
+        } finally {
+            this.destroy();
+        }
     }
 }
 

@@ -23,6 +23,12 @@ module.exports.init = async function init(hooks, app) {
             let token = app.crypt.encrypt('userid='+event.client.state.authUserId);
             event.tokens.push('kiwibnc/admin=' + token);
         }
+
+        // Auth token for the per-account client-config HTTP API (all authed users)
+        if (event.client.state.authUserId) {
+            let token = app.crypt.encrypt('userid='+event.client.state.authUserId);
+            event.tokens.push('kiwibnc/clientconfig=' + token);
+        }
     });
 };
 

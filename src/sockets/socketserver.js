@@ -28,6 +28,18 @@ module.exports = class SocketServer extends EventEmitter {
     }
 
     bindSocketEvents() {
+        // The proxy and its proxyReq hook are created once here, not per request. Registering
+        // the listener inside the request handler added a new listener to this shared emitter on
+        // every HTTP request and never removed any, so the Nth request ran N copies of
+        // buildXHeaders() - each one redoing the jsbn/CIDR maths of validateUpstreamProxy().
+        let proxy = httpProxy.createProxyServer({});
+        proxy.on('proxyReq', (proxyReq, req, res, options) => {
+            const headers = this.buildXHeaders(req);
+            Object.entries(headers).forEach(([key, val]) => {
+                proxyReq.setHeader(key, val);
+            });
+        });
+
         // We need a HTTP server for the WebSocket server to bind on as we can pass a TCP
         // connection to the HTTP server but not the WebSocket server directly.
         let httpd = http.createServer((request, response) => {
@@ -40,13 +52,6 @@ module.exports = class SocketServer extends EventEmitter {
                 return;
             }
 
-            proxy.on('proxyReq', (proxyReq, req, res, options) => {
-                const headers = this.buildXHeaders(req);
-                Object.entries(headers).forEach(([key, val]) => {
-                    proxyReq.setHeader(key, val);
-                });
-            });
-
             // Reverse proxy this HTTP request to the unix socket where the worker
             // process will pick it up and handle
             proxy.web(request, response, {
@@ -57,7 +62,6 @@ module.exports = class SocketServer extends EventEmitter {
                 },
             });
         });
-        let proxy = httpProxy.createProxyServer({});
         let wsServ = new WebSocket.Server({server: httpd});
         let socketTypes = new SocketTypeChecker();
 

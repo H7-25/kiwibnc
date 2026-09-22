@@ -9,6 +9,7 @@ const actionListUsers = require('./actions/listusers');
 const actionUpdateDb = require('./actions/updatedb');
 const actionDeleteUser = require('./actions/deleteuser');
 const actionCleanupMessages = require('./actions/cleanupmessages');
+const actionVacuumMessages = require('./actions/vacuummessages');
 
 (async function() {
     // Make the args available globally
@@ -45,6 +46,12 @@ const actionCleanupMessages = require('./actions/cleanupmessages');
         .command('cleanupmessages')
         .description('Run SQLite message retention cleanup')
         .action(actionCleanupMessages);
+
+    commander
+        .command('vacuummessages')
+        .description('Compact the message database and enable incremental space reclaim')
+        .option('--into <path>', 'Write the compacted database to this path instead of rewriting it in place. Only needs free space for the result, which may be on another disk')
+        .action(actionVacuumMessages);
 
     commander
         .command('run', { isDefault: true })

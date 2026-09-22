@@ -237,22 +237,11 @@ class ConnectionOutgoing {
                 /*
                  * Each connected client may negotiate different IRC capabilities.
                  *
-                 * message_to_client hooks can modify tags and parameters for a specific
-                 * client, so every client must receive its own independent message object.
+                 * message_to_client hooks (and the writeMsg cap handling) can modify
+                 * tags and parameters for a specific client, so every client must
+                 * receive its own independent message object.
                  */
-                const clientMessage = new Irc.Message();
-
-                clientMessage.command = message.command;
-                clientMessage.prefix = message.prefix;
-                clientMessage.nick = message.nick;
-                clientMessage.ident = message.ident;
-                clientMessage.hostname = message.hostname;
-                clientMessage.params = Array.isArray(message.params)
-                    ? message.params.slice()
-                    : [];
-                clientMessage.tags = Object.assign({}, message.tags);
-
-                client.writeMsg(clientMessage);
+                client.writeMsg(Helpers.cloneIrcMessage(message));
             }
         }
     }

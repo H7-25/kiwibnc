@@ -106,7 +106,7 @@ commands.CONNECT = {
         if (con.upstream && con.upstream.state.connected) {
             con.writeStatus(`Already connected`);
         } else {
-            con.makeUpstream();
+            await con.makeUpstream();
         }
     },
 };
@@ -209,7 +209,7 @@ commands.ATTACH = {
                 await con.registerClient();
             }
         } else {
-            con.makeUpstream(network);
+            await con.makeUpstream(network);
             con.writeStatus('Connecting to the network..');
         }
     },
@@ -283,6 +283,11 @@ commands.CHANGENETWORK = {
             } else {
                 column = columnMap[field].column;
                 type = columnMap[field].type || 'string';
+            }
+
+            // A field given without a value (eg. "addnetwork name") is parsed as a boolean
+            if (typeof val !== 'string') {
+                val = '';
             }
 
             if (type === 'string') {
@@ -369,6 +374,11 @@ commands.ADDNETWORK = {
                 type = columnMap[field].type || 'string';
             }
 
+            // A field given without a value (eg. "addnetwork name") is parsed as a boolean
+            if (typeof val !== 'string') {
+                val = '';
+            }
+
             if (type === 'string') {
                 toUpdate[column] = val;
             } else if(type === 'bool') {
@@ -388,7 +398,8 @@ commands.ADDNETWORK = {
         let missingFields = [];
         let requiredFields = ['name', 'host', 'port', 'nick'];
         requiredFields.forEach(f => {
-            if (typeof toUpdate[f] === 'undefined') {
+            let val = toUpdate[f];
+            if (typeof val === 'undefined' || (typeof val === 'string' && !val.trim())) {
                 missingFields.push(f);
             }
         });

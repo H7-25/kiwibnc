@@ -34,6 +34,10 @@ class User extends DatabaseSavable {
     get bind_host() { return this.getData('bind_host'); }
     set bind_host(newVal) { return this.setData('bind_host', newVal); }
 
+    // Opaque JSON blob of the user's client (KiwiIRC) global settings
+    get settings() { return this.getData('settings'); }
+    set settings(newVal) { return this.setData('settings', newVal); }
+
     checkPassword(password) {
         let hashed = this.password;
         return bcrypt.compareSync(password, hashed);

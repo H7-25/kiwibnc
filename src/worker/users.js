@@ -212,6 +212,39 @@ class Users {
         return user.save();
     };
 
+    async getUserSettings(userId) {
+        let user = await this.db.factories.User.query().where('id', userId).first();
+        return (user && user.settings) || '';
+    }
+
+    async setUserSettings(userId, jsonString) {
+        jsonString = typeof jsonString === 'string' ? jsonString : '';
+
+        let max = config.get('users.max_settings_size', 65536);
+        if (jsonString.length > max) {
+            throw new BncError('UserError', 'max_settings_size', 'Settings blob too large');
+        }
+
+        // Only accept a JSON object; reject anything else so we never store garbage
+        let parsed;
+        try {
+            parsed = JSON.parse(jsonString);
+        } catch (err) {
+            throw new BncError('UserError', 'invalid_settings', 'Settings must be valid JSON');
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new BncError('UserError', 'invalid_settings', 'Settings must be a JSON object');
+        }
+
+        let user = await this.db.factories.User.query().where('id', userId).first();
+        if (!user) {
+            throw new BncError('UserError', 'no_user', 'User not found');
+        }
+
+        user.settings = jsonString;
+        await user.save();
+    }
+
     async getUserNetwork(userId, networkId) {
         return this.db.factories.Network.query()
             .where('user_id', userId)
@@ -248,7 +281,7 @@ class Users {
             }
         }
 
-        if (!(netInf.name || '').trim()) {
+        if (!String(netInf.name || '').trim()) {
             throw new BncError('UserError', 'missing_name', 'A network must have a name');
         }
 

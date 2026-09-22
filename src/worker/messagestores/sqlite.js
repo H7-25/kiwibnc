@@ -1,3 +1,5 @@
+const path = require('path');
+const { Worker } = require('worker_threads');
 const sqlite3 = require('better-sqlite3');
 const LRU = require('lru-cache');
 const Stats = require('../../libs/stats');
@@ -14,10 +16,38 @@ class SqliteMessageStore {
         this.supportsRead = true;
 
         let loggingConf = config.get('logging', {});
-        this.db = new sqlite3(config.relativePath(loggingConf.database));
+        this.databasePath = config.relativePath(loggingConf.database);
+        this.db = new sqlite3(this.databasePath);
         this.retentionDaysChannels = loggingConf.retention_days_channels || 0;
         this.retentionDaysPMs = loggingConf.retention_days_pms || 0;
+        // The server tab is high volume server output, not conversation, so it follows the
+        // channel retention rather than the (usually longer) PM one
+        this.retentionDaysServer = loggingConf.retention_days_server !== undefined
+            ? parseInt(loggingConf.retention_days_server, 10)
+            : this.retentionDaysChannels;
         this.retentionCleanupInterval = loggingConf.retention_cleanup_interval || 1440; // Default 24h
+        // Minutes to wait before the first cleanup pass. Running it at boot means taking the
+        // sqlite write lock exactly when every client is reconnecting and asking for history.
+        this.retentionStartupDelay = loggingConf.retention_startup_delay !== undefined
+            ? parseInt(loggingConf.retention_startup_delay, 10)
+            : 5;
+        // Reclaiming disk space after retention has deleted messages. Only has any effect on a
+        // database in incremental auto_vacuum mode, see the 'vacuummessages' action.
+        this.vacuumEnabled = loggingConf.vacuum !== undefined
+            ? !!loggingConf.vacuum
+            : true;
+        this.vacuumChunkPages = loggingConf.vacuum_chunk_pages || 2000;
+        this.vacuumKeepFreePages = loggingConf.vacuum_keep_free_pages !== undefined
+            ? parseInt(loggingConf.vacuum_keep_free_pages, 10)
+            : 4000;
+        this.vacuumPauseMs = loggingConf.vacuum_pause_ms !== undefined
+            ? parseInt(loggingConf.vacuum_pause_ms, 10)
+            : 20;
+        // Cap the WAL file after each checkpoint. -1 leaves it at its high water mark forever,
+        // which is the sqlite default and the reason messages.db-wal never gets smaller.
+        this.walSizeLimit = loggingConf.wal_size_limit !== undefined
+            ? parseInt(loggingConf.wal_size_limit, 10)
+            : 32 * 1024 * 1024;
         this.sqliteCacheSize = loggingConf.cache_size || 2000;  // in KB, default 2MB
         this.sqliteMmapSize = loggingConf.mmap_size || 0;       // in bytes, default disabled
         this.connectHistory = loggingConf.connect_history !== undefined
@@ -27,6 +57,8 @@ class SqliteMessageStore {
 
         this.storeQueueLooping = false;
         this.storeQueue = [];
+        this.cleanupRunning = false;
+        this.vacuumRunning = false;
 
         this.dataCache = new LRU({
             max: 50 * 1000 * 1000, // very roughly 50mb cache
@@ -44,6 +76,11 @@ class SqliteMessageStore {
         }
         this.db.pragma('temp_store = MEMORY');      // Temp tables in RAM
         this.db.pragma('busy_timeout = 100');        // Short wait for locks; retries are handled async
+        if (this.walSizeLimit >= 0) {
+            // Truncate the WAL back down to this after a checkpoint instead of leaving it at
+            // whatever size a big write burst pushed it to
+            this.db.pragma(`journal_size_limit = ${this.walSizeLimit}`);
+        }
 
         this.db.exec(`
         CREATE TABLE IF NOT EXISTS logs (
@@ -105,6 +142,270 @@ class SqliteMessageStore {
         `);
         this.stmtGetExistingDataId = this.db.prepare("SELECT id FROM data WHERE data = ?");
 
+        if (this.retentionDaysChannels > 0 || this.retentionDaysPMs > 0) {
+            const runCleanupTask = async () => {
+                if (this.cleanupRunning) return;
+                this.cleanupRunning = true;
+                l.info('Running message retention cleanup');
+                let startTime = Date.now();
+                let totalDeleted = 0;
+                this.stats.increment('retention.cleanup.runs');
+
+                try {
+                    const BATCH_SIZE = 150;
+
+                    // Orphaned 'data' ids are collected in a Set and flushed as soon as there are
+                    // enough of them for a full chunk, rather than accumulating every deleted row
+                    // until the end of the run: a catch-up pass over millions of messages would
+                    // otherwise hold the whole lot in memory at once.
+                    //
+                    // Flushing mid-run stays correct because an id is only dropped from the Set
+                    // once checked, and the *last* logs row referencing it re-adds it when deleted,
+                    // so every id gets a final check after its last reference is gone.
+                    const DATA_CLEANUP_CHUNK = 900;
+                    let pendingDataIds = new Set();
+
+                    const flushDataCleanup = async (force) => {
+                        while (pendingDataIds.size >= (force ? 1 : DATA_CLEANUP_CHUNK)) {
+                            let chunk = [];
+                            for (let id of pendingDataIds) {
+                                chunk.push(id);
+                                if (chunk.length >= DATA_CLEANUP_CHUNK) break;
+                            }
+                            chunk.forEach((id) => pendingDataIds.delete(id));
+
+                            try {
+                                this.cleanupOrphanedData(chunk);
+                            } catch (cleanupErr) {
+                                l.warn('Data cleanup failed, will retry next cycle', cleanupErr.message);
+                            }
+                            // These NOT EXISTS queries are synchronous, yield between chunks
+                            await new Promise(resolve => setTimeout(resolve, 50));
+                        }
+                    };
+
+                    const processRetention = async (days, kind) => {
+                        if (days <= 0) return;
+                        let more = true;
+                        let busyRetries = 0;
+                        const isChannel = kind === 'channels';
+
+                        // The server tab is matched on prefixref, which is indexed, so it needs
+                        // none of the temp table machinery below
+                        let emptyPrefixId = null;
+                        if (kind === 'server') {
+                            let row = this.db.prepare("SELECT id FROM data WHERE data = ''").get();
+                            if (!row) {
+                                return;
+                            }
+                            emptyPrefixId = row.id;
+                        }
+
+                        // Pre-compute the set of matching buffer IDs ONCE into a temp table.
+                        //
+                        // Without this, runRetentionCleanup's IN-subquery runs a full table scan
+                        // of the 'data' table on every batch call. The 'data' column has BLOB
+                        // affinity, so SQLite cannot use the UNIQUE index for LIKE comparisons
+                        // (LIKE index optimisation only applies to TEXT affinity columns). On a
+                        // large database the scan takes several seconds and blocks the event loop
+                        // for the entire duration, stalling HTTP requests and IRC keepalives.
+                        const tempBufs = kind === 'server'
+                            ? null
+                            : (isChannel ? 'tmp_ret_ch_bufs' : 'tmp_ret_pm_bufs');
+                        if (tempBufs) {
+                            this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
+                            const bufSql = isChannel
+                                ? `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) LIKE '#%' OR CAST(data AS TEXT) LIKE '&%'`
+                                : `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) NOT LIKE '#%' AND CAST(data AS TEXT) NOT LIKE '&%'`;
+                            this.db.exec(bufSql);
+                            this.db.exec(`CREATE INDEX idx_${tempBufs} ON ${tempBufs}(id)`);
+                        }
+
+                        while (more) {
+                            // If a transaction is currently open (e.g. from storeMessageLoop), wait
+                            // until it completes to avoid nested transactions or locking issues.
+                            if (this.db.inTransaction) {
+                                if (busyRetries++ > 50) { // Wait max 5 seconds
+                                    l.warn('Database busy with other transactions, aborting retention cleanup');
+                                    if (tempBufs) this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
+                                    return;
+                                }
+                                await new Promise(resolve => setTimeout(resolve, 100));
+                                continue;
+                            }
+                            busyRetries = 0;
+
+                            let rows = [];
+                            // Transaction for the delete batch — retry on SQLITE_BUSY
+                            let retentionRetries = 0;
+                            while (true) {
+                                try {
+                                    this.db.transaction(() => {
+                                        rows = this.runRetentionCleanup(days, kind, BATCH_SIZE, tempBufs, emptyPrefixId);
+                                    })();
+                                    break;
+                                } catch (err) {
+                                    if (err.code === 'SQLITE_BUSY' && retentionRetries++ < 10) {
+                                        await new Promise(resolve => setTimeout(resolve, 200));
+                                        continue;
+                                    }
+                                    throw err;
+                                }
+                            }
+
+                            if (rows.length > 0) {
+                                for (let row of rows) {
+                                    if (row.bufferref) pendingDataIds.add(row.bufferref);
+                                    if (row.msgtagsref) pendingDataIds.add(row.msgtagsref);
+                                    if (row.dataref) pendingDataIds.add(row.dataref);
+                                    if (row.prefixref) pendingDataIds.add(row.prefixref);
+                                    if (row.paramsref) pendingDataIds.add(row.paramsref);
+                                }
+                                totalDeleted += rows.length;
+                                // Yield to event loop between batches so TCP keepalives,
+                                // reconnections and other I/O can be processed.
+                                // Without this delay, continuous synchronous SQLite writes
+                                // starve the event loop and cause IRC connection timeouts.
+                                await new Promise(resolve => setTimeout(resolve, 50));
+                                await flushDataCleanup(false);
+                            }
+
+                            if (rows.length < BATCH_SIZE) {
+                                more = false;
+                            }
+                        }
+
+                        if (tempBufs) this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
+                    };
+
+                    if (this.retentionDaysChannels > 0) {
+                        await processRetention(this.retentionDaysChannels, 'channels');
+                    }
+                    // Before the PM pass, so the PM temp table has less to walk
+                    if (this.retentionDaysServer > 0) {
+                        await processRetention(this.retentionDaysServer, 'server');
+                    }
+                    if (this.retentionDaysPMs > 0) {
+                        await processRetention(this.retentionDaysPMs, 'pms');
+                    }
+
+                    // Anything left over from the last partial chunk
+                    await flushDataCleanup(true);
+
+                    // Deleting rows only moves pages onto the freelist, it never shrinks the file
+                    await this.runVacuum();
+
+                    this.stats.gauge('retention.cleanup.rows_deleted', totalDeleted);
+                    this.stats.gauge('retention.cleanup.duration_ms', Date.now() - startTime);
+                } catch (err) {
+                    l.error('Error running retention cleanup', err);
+                    this.stats.increment('retention.cleanup.errors');
+                } finally {
+                    this.cleanupRunning = false;
+                }
+            };
+
+            // Delay the first pass rather than running it during startup, when every client is
+            // reconnecting and requesting history
+            let startupTimer = setTimeout(runCleanupTask, this.retentionStartupDelay * 60 * 1000);
+            // Run cleanup periodically
+            let intervalTimer = setInterval(runCleanupTask, this.retentionCleanupInterval * 60 * 1000);
+            // Neither timer should be a reason for the process to stay alive
+            startupTimer.unref();
+            intervalTimer.unref();
+        }
+    }
+
+    /**
+     * Hands free pages back to the filesystem, in a worker thread.
+     *
+     * Deleting messages puts their pages on sqlite's freelist, where they are reused by new
+     * messages but never returned to the OS - which is why messages.db only ever grows. Only a
+     * database in incremental auto_vacuum mode can give them back without a full offline VACUUM.
+     */
+    async runVacuum() {
+        if (!this.vacuumEnabled || this.vacuumRunning) {
+            return;
+        }
+
+        // Nothing to reclaim on a database that only exists in memory
+        if (!this.databasePath || this.databasePath.indexOf(':memory:') > -1) {
+            return;
+        }
+
+        // incremental_vacuum is a no-op unless the database was built with, or converted to,
+        // incremental auto_vacuum. Converting needs a one-off offline VACUUM.
+        let autoVacuum = this.db.pragma('auto_vacuum', { simple: true });
+        if (autoVacuum !== 2) {
+            if (!this.warnedVacuumMode) {
+                this.warnedVacuumMode = true;
+                l.info(
+                    'Message database is not in incremental auto_vacuum mode so disk space is ' +
+                    'never reclaimed. Stop the bouncer and run "kiwibnc vacuummessages" to convert it'
+                );
+            }
+            return;
+        }
+
+        let free = this.db.pragma('freelist_count', { simple: true });
+        if (free <= this.vacuumKeepFreePages) {
+            return;
+        }
+
+        this.vacuumRunning = true;
+        let startTime = Date.now();
+        this.stats.increment('retention.vacuum.runs');
+
+        try {
+            await new Promise((resolve) => {
+                let worker = new Worker(path.join(__dirname, 'vacuumworker.js'), {
+                    workerData: {
+                        file: this.databasePath,
+                        chunkPages: this.vacuumChunkPages,
+                        keepFreePages: this.vacuumKeepFreePages,
+                        pausePerChunk: this.vacuumPauseMs,
+                        // The vacuum is the one that should wait, not the messages being stored
+                        busyTimeout: 5000,
+                        walSizeLimit: this.walSizeLimit,
+                    },
+                });
+
+                let settled = false;
+                let finish = () => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    resolve();
+                };
+
+                worker.on('message', (msg) => {
+                    if (msg.ok) {
+                        let mb = (msg.pagesFreed * msg.pageSize) / (1024 * 1024);
+                        l.info(
+                            `Vacuum returned ${msg.pagesFreed} pages (${mb.toFixed(1)}MB) to disk` +
+                            (msg.walTruncated ? ', WAL truncated' : ', WAL busy and left as is')
+                        );
+                        this.stats.gauge('retention.vacuum.pages_freed', msg.pagesFreed);
+                    } else {
+                        l.warn('Vacuum failed, will retry next cycle:', msg.error);
+                        this.stats.increment('retention.vacuum.errors');
+                    }
+                });
+
+                // A failure in the thread must never take the worker process down with it
+                worker.on('error', (err) => {
+                    l.warn('Vacuum thread error, will retry next cycle:', err.message);
+                    this.stats.increment('retention.vacuum.errors');
+                    finish();
+                });
+                worker.on('exit', finish);
+            });
+
+            this.stats.gauge('retention.vacuum.duration_ms', Date.now() - startTime);
+        } finally {
+            this.vacuumRunning = false;
+        }
     }
 
     /**
@@ -114,21 +415,32 @@ class SqliteMessageStore {
     runDataCleanup(deletedRows) {
         if (!deletedRows || deletedRows.length === 0) return;
 
+        // Extract all unique IDs from the deleted rows
+        const candidateIds = new Set();
+        for (const row of deletedRows) {
+            if (row.bufferref) candidateIds.add(row.bufferref);
+            if (row.msgtagsref) candidateIds.add(row.msgtagsref);
+            if (row.dataref) candidateIds.add(row.dataref);
+            if (row.prefixref) candidateIds.add(row.prefixref);
+            if (row.paramsref) candidateIds.add(row.paramsref);
+        }
+
+        const allIds = Array.from(candidateIds);
+        const CHUNK = 900;
+        for (let i = 0; i < allIds.length; i += CHUNK) {
+            this.cleanupOrphanedData(allIds.slice(i, i + CHUNK));
+        }
+    }
+
+    /**
+     * Deletes the given 'data' rows if nothing in 'logs' references them any more
+     * @param {Array} allIds - Candidate data ids to check
+     */
+    cleanupOrphanedData(allIds) {
+        if (!allIds || allIds.length === 0) return;
+
         this.db.transaction(() => {
-            l.info('Running orphaned data cleanup (incremental)');
-
-            // Extract all unique IDs from the deleted rows
-            const candidateIds = new Set();
-            for (const row of deletedRows) {
-                if (row.bufferref) candidateIds.add(row.bufferref);
-                if (row.msgtagsref) candidateIds.add(row.msgtagsref);
-                if (row.dataref) candidateIds.add(row.dataref);
-                if (row.prefixref) candidateIds.add(row.prefixref);
-                if (row.paramsref) candidateIds.add(row.paramsref);
-            }
-
-            if (candidateIds.size === 0) return;
-            const allIds = Array.from(candidateIds);
+            l.debug('Running orphaned data cleanup (incremental)');
 
             const placeholders = allIds.map(() => '?').join(',');
 
@@ -149,14 +461,21 @@ class SqliteMessageStore {
                     SELECT 1 FROM logs WHERE paramsref = data.id
                     LIMIT 1
                 )
+                RETURNING data
             `);
 
-            const info = stmt.run(...allIds);
+            const deleted = stmt.all(...allIds);
 
-            if (info.changes > 0) {
-                l.info(`Orphaned data cleanup removed ${info.changes} rows`);
-                // Clear the cache to prevent reusing IDs that have just been deleted
-                this.dataCache.reset();
+            if (deleted.length > 0) {
+                l.info(`Orphaned data cleanup removed ${deleted.length} rows`);
+                // Drop just the deleted values from the cache, so we don't hand out ids that no
+                // longer exist. Cleanup now runs several times per retention pass, and resetting
+                // the whole cache each time would push every following write back to an
+                // INSERT-then-SELECT round trip.
+                for (const row of deleted) {
+                    let key = typeof row.data === 'string' ? row.data : String(row.data);
+                    this.dataCache.del(key);
+                }
             }
         })();
     }
@@ -168,15 +487,30 @@ class SqliteMessageStore {
      * @param {number} limit - Max number of rows to delete per batch
      * @returns {Array} Deleted rows with their references
      */
-    runRetentionCleanup(days, isChannel, limit, bufTableName) {
+    runRetentionCleanup(days, kind, limit, bufTableName, emptyPrefixId) {
         if (days <= 0) return [];
 
+        const isChannel = kind === 'channels';
         let cutoffDate = new Date();
         cutoffDate.setDate(cutoffDate.getDate() - days);
         let cutoffTime = cutoffDate.getTime();
 
         let sql;
-        if (bufTableName) {
+        let params = [cutoffTime, limit || 1000];
+        if (kind === 'server') {
+            // A message with no sender is server output, never a conversation. Matching on
+            // prefixref uses logs_prefixref, so this needs no temp table of buffer ids.
+            sql = `
+                DELETE FROM logs
+                WHERE rowid IN (
+                    SELECT rowid FROM logs
+                    WHERE prefixref = ? AND time < ?
+                    LIMIT ?
+                )
+                RETURNING bufferref, msgtagsref, dataref, prefixref, paramsref
+            `;
+            params = [emptyPrefixId, cutoffTime, limit || 1000];
+        } else if (bufTableName) {
             // Use the pre-computed temp table of buffer IDs (avoids repeated full table
             // scan of the data column which has BLOB affinity and cannot use LIKE index).
             sql = `
@@ -219,8 +553,9 @@ class SqliteMessageStore {
             `;
         }
 
-        let rows = this.db.prepare(sql).all(cutoffTime, limit || 1000);
-        l.info(`Retention cleanup (${isChannel ? 'channels' : 'PMs'}, >${days} days) removed ${rows.length} messages`);
+        let label = kind === 'channels' ? 'channels' : kind === 'server' ? 'server tab' : 'PMs';
+        let rows = this.db.prepare(sql).all(...params);
+        l.info(`Retention cleanup (${label}, >${days} days) removed ${rows.length} messages`);
         return rows;
     }
 
@@ -573,7 +908,8 @@ class SqliteMessageStore {
             // We do want to log ACTIONs though
             if (!message.params[1].startsWith('\x01ACTION')) {
                 this.storeQueueLooping = false;
-                this.storeMessageLoop();
+                // Nothing to store for this one, but the queue must keep draining
+                setImmediate(() => this.storeMessageLoop());
                 return;
             }
         }
@@ -595,7 +931,8 @@ class SqliteMessageStore {
 
         if (!type) {
             this.storeQueueLooping = false;
-            this.storeMessageLoop();
+            // Not a message type we log (JOIN, PART, ...), move on to the next queued item
+            setImmediate(() => this.storeMessageLoop());
             return;
         }
 
@@ -628,7 +965,15 @@ class SqliteMessageStore {
             })();
         } catch (err) {
             if (err.code === 'SQLITE_BUSY') {
-                l.warn('storeMessage: database busy, retrying in 100ms');
+                // args has already been shifted off the queue, put it back or the message is lost
+                args.busyRetries = (args.busyRetries || 0) + 1;
+                if (args.busyRetries <= 10) {
+                    l.warn('storeMessage: database busy, retrying in 100ms');
+                    this.storeQueue.unshift(args);
+                } else {
+                    l.error('storeMessage: database still busy after 10 retries, dropping message');
+                    this.stats.increment('store.dropped');
+                }
                 setTimeout(() => { this.storeQueueLooping = false; this.storeMessageLoop(); }, 100);
                 return;
             }
@@ -645,7 +990,11 @@ class SqliteMessageStore {
 
     async storeMessage(message, upstreamCon, clientCon) {
         this.storeQueue.push({message, upstreamCon, clientCon});
-        this.storeMessageLoop();
+        // Schedule the write rather than running it inline. storeMessageLoop() is synchronous all
+        // the way to the insert, so calling it directly runs the transaction inside the command
+        // handler, ie. before the message has been relayed to connected clients - any wait on the
+        // sqlite write lock would land straight on message delivery latency.
+        setImmediate(() => this.storeMessageLoop());
     }
 
     deleteUserMessages(userId) {

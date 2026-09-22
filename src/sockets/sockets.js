@@ -29,6 +29,20 @@ async function run() {
         app.conf.load();
     });
 
+    // The worker asks, after a worker-only restart, which connections are still alive here so it
+    // can reap any incoming connections whose socket did not survive. Reply with the ids of every
+    // currently-connected socket.
+    app.queue.on('connections.getactive', async (event) => {
+        let ids = [];
+        cons.forEach((con, id) => {
+            if (con.connected) {
+                ids.push(id);
+            }
+        });
+        l.info(`Reporting ${ids.length} active connections to the worker`);
+        app.queue.sendToWorker('connections.active', {ids});
+    });
+
     app.queue.on('connection.data', async (event) => {
         let con = cons.get(event.id);
         if (!con) {

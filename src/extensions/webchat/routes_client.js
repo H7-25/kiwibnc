@@ -53,6 +53,64 @@ module.exports = function(app) {
         ctx.body = config;
     });
 
+    // Auth for the per-account client-config API: decrypt the kiwibnc/clientconfig
+    // ISUPPORT token (encrypted `userid=<id>`) and expose it as ctx.state.userId.
+    async function clientAuth(ctx, next) {
+        if (!ctx.headers['x-auth']) {
+            ctx.response.status = 403;
+            return;
+        }
+
+        let userId = null;
+        try {
+            let token = app.crypt.decrypt(ctx.headers['x-auth']) || '';
+            let m = token.match(/^userid=(\d+)/);
+            if (!m) {
+                throw new Error('invalid token');
+            }
+            userId = parseInt(m[1], 10);
+        } catch (err) {
+            ctx.response.status = 403;
+            return;
+        }
+
+        ctx.state.userId = userId;
+        await next();
+    }
+
+    router.get('kiwi.clientconfig', '/api/clientconfig', clientAuth, async (ctx, next) => {
+        let raw = await app.userDb.getUserSettings(ctx.state.userId);
+        let settings = {};
+        if (raw) {
+            try {
+                let parsed = JSON.parse(raw);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    settings = parsed;
+                }
+            } catch (err) {
+                // Stored value is corrupt; hand back an empty object rather than erroring
+            }
+        }
+        ctx.body = { settings };
+    });
+
+    router.put('kiwi.clientconfig', '/api/clientconfig', clientAuth, async (ctx, next) => {
+        let settings = ctx.request.body && ctx.request.body.settings;
+        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+            ctx.body = { error: 'invalid_settings' };
+            return;
+        }
+
+        try {
+            await app.userDb.setUserSettings(ctx.state.userId, JSON.stringify(settings));
+        } catch (err) {
+            ctx.body = { error: err.code || 'unknown_error' };
+            return;
+        }
+
+        ctx.body = { error: false };
+    });
+
     app.webserver.router.post('kiwi.config', '/api/register', async (ctx, next) => {
         if (!app.conf.get('webchat.public_register', false)) {
             ctx.body = {error: 'forbidden'};

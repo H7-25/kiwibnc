@@ -1027,6 +1027,10 @@
                 kiwi.addTab('settings', 'KiwiBNC Admin', AdminScreen);
             }
 
+            // Restore the account-level KiwiIRC settings blob from the BNC (survives
+            // localStorage being wiped, e.g. Edge clearing site data on close).
+            loadUserConfig(network);
+
             // Sync bouncer buffers at MOTD (like KiwiIRC native BouncerProvider)
             // The BouncerMiddleware adds bnc.tags() method to decode the bouncer CAP token
             if (network.ircClient.bnc && network.ircClient.bnc.hasNetwork()) {
@@ -1038,6 +1042,97 @@
                 }
             }
         });
+
+        // --- Account-level KiwiIRC settings (user_settings) persistence ---------------
+        // Mirrors the per-buffer sync in spirit (snapshot anti-echo + init gate) but the
+        // whole user_settings blob can exceed an IRC line (aliases), so it rides HTTP
+        // instead of the BOUNCER protocol. Auth via the kiwibnc/clientconfig ISUPPORT token.
+        const userConfigState = {
+            token: '',
+            loaded: false,        // initial GET applied
+            snapshot: null,       // JSON string last synced to the BNC
+            watcherAttached: false,
+        };
+
+        function putUserConfig(settingsObj) {
+            if (!userConfigState.token) {
+                return;
+            }
+            fetch(basePath + '/api/clientconfig', {
+                method: 'PUT',
+                headers: new Headers({
+                    'x-auth': userConfigState.token,
+                    'content-type': 'application/json',
+                }),
+                body: JSON.stringify({ settings: settingsObj || {} }),
+            }).catch((err) => {
+                log.debug('kiwibnc: failed to save client config', err && err.message);
+            });
+        }
+
+        function loadUserConfig(network) {
+            if (userConfigState.loaded) {
+                return;
+            }
+            const token = network.ircClient.network.supports('kiwibnc/clientconfig');
+            if (!token) {
+                return;
+            }
+            userConfigState.token = token;
+
+            fetch(basePath + '/api/clientconfig', { headers: new Headers({ 'x-auth': token }) })
+                .then((resp) => resp.json())
+                .then((resp) => {
+                    const serverSettings = (resp && resp.settings && typeof resp.settings === 'object' && !Array.isArray(resp.settings)) ?
+                        resp.settings : {};
+                    const localSettings = kiwi.state.user_settings || {};
+                    const serverEmpty = Object.keys(serverSettings).length === 0;
+                    const localNonEmpty = Object.keys(localSettings).length > 0;
+
+                    if (serverEmpty && localNonEmpty) {
+                        // First connect for this account: migrate the existing local
+                        // settings up to the BNC instead of wiping them with an empty blob.
+                        userConfigState.snapshot = JSON.stringify(localSettings);
+                        putUserConfig(localSettings);
+                    } else {
+                        // Server is authoritative: apply its blob. Passing only user_settings
+                        // (no networks key) means importState does NOT reset networks/buffers.
+                        kiwi.state.importState(JSON.stringify({ user_settings: serverSettings }));
+                        userConfigState.snapshot = JSON.stringify(kiwi.state.user_settings || {});
+                    }
+                    userConfigState.loaded = true;
+                })
+                .catch((err) => {
+                    log.debug('kiwibnc: failed to load client config', err && err.message);
+                });
+        }
+
+        // Push local user_settings changes up to the BNC (debounced, snapshot-gated).
+        function attachUserSettingsWatcher() {
+            if (userConfigState.watcherAttached) {
+                return;
+            }
+            if (!kiwi.state || !_.isFunction(kiwi.state.$watch)) {
+                return;
+            }
+            userConfigState.watcherAttached = true;
+
+            const pushConfig = _.debounce(() => {
+                // Don't push until the initial GET has been applied, otherwise startup
+                // local state could overwrite the BNC's stored blob.
+                if (!userConfigState.loaded) {
+                    return;
+                }
+                const currentStr = JSON.stringify(kiwi.state.user_settings || {});
+                if (currentStr === userConfigState.snapshot) {
+                    return;
+                }
+                userConfigState.snapshot = currentStr;
+                putUserConfig(kiwi.state.user_settings || {});
+            }, 2000);
+
+            kiwi.state.$watch('user_settings', pushConfig, { deep: true });
+        }
 
         // Push local per-buffer setting changes to the BNC so they persist and sync
         // across the user's other connected clients. This is the write side of the
@@ -1119,6 +1214,7 @@
         // Attach listener immediately on plugin load
         attachBouncerListener();
         attachBufferSettingsWatcher();
+        attachUserSettingsWatcher();
     });
 </script>
 

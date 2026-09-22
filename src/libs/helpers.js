@@ -48,13 +48,17 @@ function parseBindString(inp) {
 module.exports.cloneIrcMessage = cloneIrcMessage;
 function cloneIrcMessage(srcMsg) {
     let msg = new srcMsg.constructor(srcMsg.command);
-    msg.tags = srcMsg.tags;
+    // Copy tags/params by value, not reference, so callers can mutate the clone
+    // (add a msgid tag, strip a cap-specific param, etc.) without affecting the
+    // original message or any other clone. tags is given a null prototype to match
+    // irc-framework and to copy a literal `__proto__` tag faithfully.
+    msg.tags = Object.assign(Object.create(null), srcMsg.tags);
     msg.prefix = srcMsg.prefix;
     msg.nick = srcMsg.nick;
     msg.ident = srcMsg.ident;
     msg.hostname = srcMsg.hostname;
     msg.command = srcMsg.command;
-    msg.params = srcMsg.params;
+    msg.params = Array.isArray(srcMsg.params) ? srcMsg.params.slice() : [];
     return msg;
 }
 

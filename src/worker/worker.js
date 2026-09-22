@@ -33,6 +33,14 @@ async function run() {
     // Container for all connection instances
     app.cons = new ConnectionDict(app.db, app.userDb, app.messages, app.queue);
 
+    // A rejected promise that nobody awaited would otherwise kill the worker. As the queue
+    // redelivers whatever message was in flight, that turns a single bad message into a crash
+    // loop that hammers everybody and backs the queue up. Log it loudly and stay alive instead.
+    process.on('unhandledRejection', (reason) => {
+        let stack = (reason && reason.stack) || reason;
+        l.error(`### Unhandled rejection - this should not happen but the worker is still running. ${stack}`);
+    });
+
     app.prepareShutdown = () => prepareShutdown(app);
     process.on('SIGQUIT', () => {
         app.prepareShutdown();
@@ -62,7 +70,37 @@ async function run() {
     // Now that all the connection states have been laoded, start accepting events for them
     listenToQueue(app);
 
+    // Reconcile reloaded incoming connections against the sockets layer, reaping any whose
+    // socket did not survive our restart.
+    reconcileIncomingConnections(app);
+
     return app;
+}
+
+// After a worker-only restart the sockets layer keeps client sockets alive, so loadConnections()
+// reloads every incoming connection row. But rows whose socket died while we were down never
+// receive a connection.close, so they would linger forever as zombies that still get forwarded
+// messages (inflating linkedIncomingConIds and duplicating traffic). Ask the sockets layer which
+// connections are actually alive; mark survivors connected and purge the rest. The reply is
+// handled by the 'connections.active' listener registered in listenToQueue().
+function reconcileIncomingConnections(app) {
+    let pending = app.reloadedIncomingConIds;
+    if (!pending || pending.size === 0) {
+        return;
+    }
+
+    l.info(`Reconciling ${pending.size} reloaded incoming connections against the sockets layer`);
+    app.queue.sendToSockets('connections.getactive', {});
+
+    // Fail-safe: if the sockets layer never answers (e.g. an older version without the
+    // connections.getactive handler), do not reap anything — leaving a live connection alone
+    // is safer than wrongly killing it.
+    app.reconcileIncomingTimer = setTimeout(() => {
+        if (app.reloadedIncomingConIds && app.reloadedIncomingConIds.size > 0) {
+            l.warn(`Incoming connection reconciliation timed out; leaving ${app.reloadedIncomingConIds.size} connections untouched`);
+        }
+        app.reloadedIncomingConIds = null;
+    }, 30000);
 }
 
 async function initExtensions(app) {
@@ -230,6 +268,43 @@ function listenToQueue(app) {
             con.writeLine('CAP', 'LIST');
         }
     });
+    // Reply to reconcileIncomingConnections(): the sockets layer tells us which connection ids
+    // are actually alive. Mark reloaded incoming survivors as connected and reap the zombies.
+    app.queue.on('connections.active', async (event) => {
+        let pending = app.reloadedIncomingConIds;
+        if (!pending) {
+            return;
+        }
+        if (app.reconcileIncomingTimer) {
+            clearTimeout(app.reconcileIncomingTimer);
+            app.reconcileIncomingTimer = null;
+        }
+
+        let liveIds = new Set(event.ids || []);
+        let reaped = 0;
+        for (const id of pending) {
+            let con = cons.get(id);
+            if (!con || !(con instanceof ConnectionIncoming)) {
+                continue;
+            }
+
+            if (liveIds.has(id)) {
+                // Socket survived our restart — restore the connected flag that the reload lost.
+                con.state.connected = true;
+                con.state.markDirty();
+            } else {
+                // Socket is gone. destroy() unlinks from the upstream, removes it from the
+                // connection dict and deletes its persisted row.
+                l.info(`Reaping stale incoming connection ${id} (socket not alive in sockets layer)`);
+                con.destroy();
+                reaped++;
+            }
+        }
+
+        l.info(`Incoming reconciliation done: reaped ${reaped} stale connection(s)`);
+        app.reloadedIncomingConIds = null;
+    });
+
     app.queue.on('connection.error', async (event) => {
         l.error(`Server error ${event.id} ${event.error.message}`);
     });
@@ -241,10 +316,15 @@ function listenToQueue(app) {
         }
 
         let con = cons.get(event.id);
-        if (con && con instanceof ConnectionOutgoing) {
-            await con.onUpstreamClosed(event.error);
-        } else if (con && con instanceof ConnectionIncoming) {
-            await con.onClientClosed(event.error);
+        try {
+            if (con && con instanceof ConnectionOutgoing) {
+                await con.onUpstreamClosed(event.error);
+            } else if (con && con instanceof ConnectionIncoming) {
+                await con.onClientClosed(event.error);
+            }
+        } catch (err) {
+            // A rejection here would otherwise vanish silently into the queue handler
+            l.error(`Error closing connection ${event.id}:`, err.stack || err.message);
         }
     });
     app.queue.on('connection.data', async (event) => {
@@ -414,6 +494,28 @@ async function reconcileOutgoingConnections(app) {
     await app.db.dbConnections('connections')
         .where('type', ConnectionDict.TYPE_OUTGOING)
         .update({ connected: 0 });
+
+    // Incoming rows keep pointing at their network after it's deleted. Any later
+    // makeUpstream() for them would look up a network that isn't there, so detach
+    // them and let the client re-attach to something that exists.
+    let incomingRows = await app.db.dbConnections('connections')
+        .where('type', ConnectionDict.TYPE_INCOMING)
+        .whereNot('auth_network_id', 0)
+        .select('conid', 'auth_network_id');
+
+    let orphanIncoming = incomingRows
+        .filter((r) => !validNetworkIds.has(Number(r.auth_network_id)))
+        .map((r) => r.conid);
+
+    if (orphanIncoming.length > 0) {
+        l.info(`Reconciling incoming connections: detaching ${orphanIncoming.length} row(s) from deleted networks`);
+        const CHUNK = 400;
+        for (let i = 0; i < orphanIncoming.length; i += CHUNK) {
+            await app.db.dbConnections('connections')
+                .whereIn('conid', orphanIncoming.slice(i, i + CHUNK))
+                .update({ auth_network_id: 0 });
+        }
+    }
 }
 
 // Prefer the row the live socket is keyed to. We can't query the sockets layer,
@@ -439,6 +541,11 @@ async function loadConnections(app) {
     let rows = await app.db.dbConnections.raw('SELECT conid, type, bind_host, auth_user_id FROM connections');
     l.info(`Loading ${rows.length} connections`);
     let types = ['OUTGOING', 'INCOMING', 'LISTENING'];
+    // Track the incoming connections we reload so we can reconcile them against the
+    // sockets layer once the queue is listening: any whose socket did not survive our
+    // restart must be reaped, otherwise they linger as zombies (connected=0,
+    // netRegistered=1) that still receive forwarded messages. See reconcileIncomingConnections().
+    app.reloadedIncomingConIds = new Set();
     for (const row of rows) {
         l.debug(`connection ${row.conid} ${types[row.type]} ${row.bind_host}`);
 
@@ -451,6 +558,7 @@ async function loadConnections(app) {
                 continue;
             }
             await app.cons.loadFromId(row.conid, row.type);
+            app.reloadedIncomingConIds.add(row.conid);
         } else if (row.type === ConnectionDict.TYPE_OUTGOING) {
             let con = await app.cons.loadFromId(row.conid, row.type);
             con.open();
@@ -506,6 +614,10 @@ async function initWebserver(app) {
             // These errors are expected as clients always disconnect at random times before
             // waiting for a response, or general network issues
             return;
+        } else if (error.status >= 400 && error.status < 500) {
+            // A bad request the server already rejected, eg a scanner probing for path
+            // traversal. Logging a stack per attempt lets anyone flood the log at will
+            l.debug(`Webserver ${error.status} ${error.message}`);
         } else {
             l.error('Webserver error', error);
         }

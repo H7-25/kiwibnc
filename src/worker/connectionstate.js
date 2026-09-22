@@ -189,6 +189,7 @@ class ConnectionState {
         // Debounced save state
         this._dirty = false;
         this._saveTimer = null;
+        this._destroyed = false;
     }
 
     async maybeLoad() {
@@ -198,6 +199,11 @@ class ConnectionState {
     }
 
     markDirty() {
+        // A save after destroy() would insert-or-replace the row we just deleted
+        if (this._destroyed) {
+            return;
+        }
+
         this._dirty = true;
         if (!this._saveTimer) {
             this._saveTimer = setTimeout(() => {
@@ -209,6 +215,10 @@ class ConnectionState {
     }
 
     async save() {
+        if (this._destroyed) {
+            return;
+        }
+
         let query = this.db.dbConnections('connections').insert({
             conid: this.conId,
             last_statesave: Helpers.now(),
@@ -368,6 +378,14 @@ class ConnectionState {
     }
 
     async destroy() {
+        // Cancel the pending debounced save, it would otherwise recreate the row we delete here
+        this._destroyed = true;
+        this._dirty = false;
+        if (this._saveTimer) {
+            clearTimeout(this._saveTimer);
+            this._saveTimer = null;
+        }
+
         await this.db.dbConnections('connections').where('conid', this.conId).delete();
     }
 

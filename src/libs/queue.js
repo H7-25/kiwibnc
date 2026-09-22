@@ -12,6 +12,8 @@ module.exports = class Queue extends EventEmitter {
         this.queueToSockets = conf.get('queue.sockets_queue', 'q_sockets');
         this.queueToWorker = conf.get('queue.worker_queue', 'q_worker');
         this.channel = null;
+        // The connection owning this.channel, kept so a reconnect can close it (see _closeConn)
+        this.conn = null;
         this.consumerTag = '';
         this.closing = false;
         this.reconnecting = false;
@@ -46,7 +48,43 @@ module.exports = class Queue extends EventEmitter {
         return this._connectPromise;
     }
 
+    // Closes the connection we're about to replace and waits for the broker to release its
+    // consumers. Never rejects - a connection being discarded has nothing useful to fail at.
+    _closeConn() {
+        let conn = this.conn;
+        this.conn = null;
+        this.channel = null;
+        if (!conn) {
+            return Promise.resolve();
+        }
+
+        return new Promise((resolve) => {
+            let done = false;
+            let finish = () => {
+                if (done) {
+                    return;
+                }
+                done = true;
+                resolve();
+            };
+
+            // An already dead connection may never call back, and connect() shares one promise
+            // between all its callers, so hanging here would block every later attempt
+            setTimeout(finish, 2000).unref();
+            try {
+                conn.close(finish);
+            } catch (err) {
+                finish();
+            }
+        });
+    }
+
     async _doConnect() {
+        // A dead channel does not close its connection, and that connection still owns the
+        // exclusive consumer on our queue. Opening a new one without closing it first gets
+        // ACCESS_REFUSED, which closes the new channel and reconnects, forever.
+        await this._closeConn();
+
         let {conn, channel} = await this.getChannel();
         await channel.assertQueue(this.queueToSockets, {durable: true});
         await channel.assertQueue(this.queueToWorker, {durable: true});
@@ -78,6 +116,7 @@ module.exports = class Queue extends EventEmitter {
         channel.on('close', () => onLost('channel closed'));
 
         this.channel = channel;
+        this.conn = conn;
 
         // Re-arm consumption on the fresh channel. No-op for send-only
         // instances and when already bound, so every reconnect path
@@ -129,7 +168,15 @@ module.exports = class Queue extends EventEmitter {
         tryReconnect();
     }
 
-    safeAck(msg) {
+    safeAck(msg, channel) {
+        // A delivery tag only means anything on the channel that delivered it. Acking one
+        // on a fresh channel is answered with PRECONDITION_FAILED, which closes that
+        // channel and reconnects - and since every queued message from the old channel
+        // does it in turn, the reconnects loop. Skipping is safe: the broker redelivers.
+        if (channel && channel !== this.channel) {
+            l.debug('AMQP message from a replaced channel, it will be redelivered');
+            return;
+        }
         // The channel can be nulled out mid-processing by an unexpected close
         // (the await in processMsgQueue yields). Skipping the ack is safe: the
         // broker redelivers unacked messages once the consumer is re-armed.
@@ -171,24 +218,27 @@ module.exports = class Queue extends EventEmitter {
         await this._send(this.queueToSockets, Buffer.from(payload), {persistent});
     }
 
+    // Never rejects. Callers fire this from socket event handlers without awaiting, so a
+    // rejection here is an unhandledRejection, which Node treats as fatal.
     async _send(queue, buffer, options) {
-        if (!this.channel) {
-            await this.connect();
+        try {
+            if (!this.channel) {
+                await this.connect();
+            }
+            this.channel.sendToQueue(queue, buffer, options);
+            return;
+        } catch (err) {
+            // Broker gone, or the channel closed between the null check and the send
+            this.channel = null;
+            l.warn('AMQP sendToQueue failed, reconnecting and retrying:', err.message);
         }
 
         try {
-            this.channel.sendToQueue(queue, buffer, options);
-        } catch (err) {
-            // Channel closed between the null check and the send (race condition).
-            // Null it out and retry once after reconnecting.
-            this.channel = null;
-            l.warn('AMQP sendToQueue failed, reconnecting and retrying:', err.message);
             await this.connect();
-            try {
-                this.channel.sendToQueue(queue, buffer, options);
-            } catch (retryErr) {
-                l.error('AMQP sendToQueue failed after reconnect, dropping message:', retryErr.message);
-            }
+            this.channel.sendToQueue(queue, buffer, options);
+        } catch (retryErr) {
+            l.error('AMQP sendToQueue failed after reconnect, dropping message:', retryErr.message);
+            this.scheduleReconnect();
         }
     }
 
@@ -236,7 +286,7 @@ module.exports = class Queue extends EventEmitter {
 
             messageTmr.stop();
             qMessage.ack();
-            this.safeAck(qMessage.item.amqpMsg);
+            this.safeAck(qMessage.item.amqpMsg, qMessage.item.amqpChannel);
 
             cnt++;
             if (now() - lastCnt > 5) {
@@ -257,7 +307,9 @@ module.exports = class Queue extends EventEmitter {
         // Stored so scheduleReconnect() can re-register the consumer on a fresh
         // channel after a drop. Reuses the same queue/pipeline state above.
         this._startConsuming = () => {
-            this.channel.consume(queueName, (msg) => {
+            // Captured so each message is acked on the channel it arrived on, see safeAck()
+            let channel = this.channel;
+            channel.consume(queueName, (msg) => {
                 if (this.closing) {
                     return;
                 }
@@ -278,7 +330,7 @@ module.exports = class Queue extends EventEmitter {
                 // Messages are expected to be an array of 2 items: [event_name, obj_of_params]
                 if (!obj || obj.length !== 2) {
                     this.stats.increment('message.ignored');
-                    this.safeAck(msg);
+                    this.safeAck(msg, channel);
                     return;
                 }
 
@@ -289,14 +341,14 @@ module.exports = class Queue extends EventEmitter {
                     if (obj[1] && obj[1].id) {
                         // This event is related to a connection ID
                         let conId = obj[1].id;
-                        q.add('connection', conId, {amqpMsg: msg, event: obj});
+                        q.add('connection', conId, {amqpMsg: msg, amqpChannel: channel, event: obj});
                     } else {
                         // An internal bnc event
-                        q.add('bnc', 'internal', {amqpMsg: msg, event: obj});
+                        q.add('bnc', 'internal', {amqpMsg: msg, amqpChannel: channel, event: obj});
                     }
 
                 } else {
-                    this.safeAck(msg);
+                    this.safeAck(msg, channel);
                 }
 
                 process.nextTick(() => {
@@ -357,6 +409,9 @@ module.exports = class Queue extends EventEmitter {
                 this.stats.increment('connecting.time');
                 conn.createChannel((err, channel) => {
                     if (err) {
+                        // Nothing else references this connection, and leaving it open would
+                        // hold the exclusive consumer against the next attempt
+                        try { conn.close(); } catch (e) {}
                         reject(err);
                         return;
                     }
