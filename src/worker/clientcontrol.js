@@ -64,8 +64,19 @@ commands.HELP = {
             let isAdmin = con.state.authAdmin;
             let userCommandList = [];
             let adminCommandList = [];
+            let singleNetwork = config.get('users.max_networks', -1) === 1;
+            let singleNetworkCommands = [
+                'ADDNETWORK',
+                'ATTACH',
+                'CHANGENETWORK',
+                'DELNETWORK',
+                'LISTNETWORKS',
+            ];
             
             Object.entries(commands).forEach(([name, command]) => {
+                if (singleNetwork && singleNetworkCommands.includes(name)) {
+                    return;
+                }
                 if (command.skipCommandList === true) {
                     return;
                 }
@@ -130,7 +141,8 @@ commands.LISTCLIENTS = {
         let entries = [];
         if (con.upstream) {
             con.upstream.forEachClient(client => {
-                entries.push(`Client: ${client.state.host}`);
+                let clientType = client.state.host === '127.0.0.1' ? 'Web Client' : 'IRC Client';
+                entries.push(`Client: ${clientType}`);
             });
         }
 
