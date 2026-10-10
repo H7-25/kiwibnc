@@ -27,6 +27,17 @@ class MessageStores {
         }
     }
 
+    async getTargets(...args) {
+        let readable = this.stores.find(s =>
+            s.supportsRead && typeof s.getTargets === 'function'
+        );
+        if (!readable) {
+            return [];
+        }
+
+        return await readable.getTargets(...args);
+    }
+
     async getMessagesFromMsgId(...args) {
         let readable = this.stores.find(s => s.supportsRead);
         if (!readable) {

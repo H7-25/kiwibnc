@@ -581,6 +581,37 @@ class SqliteMessageStore {
         return null;
     }
 
+    async getTargets(userId, networkId, fromTime, toTime, length) {
+        let messagesTmr = this.stats.timerStart('lookup.time');
+
+        let stmt = this.db.prepare(`
+            SELECT
+                d_buffer.data as buffer,
+                MAX(logs.time) as time
+            FROM logs
+            LEFT JOIN data d_buffer ON logs.bufferref = d_buffer.id
+            WHERE
+                logs.user_id = :user_id
+                AND logs.network_id = :network_id
+                AND logs.time <= :from_time
+                AND logs.time >= :to_time
+            GROUP BY logs.bufferref
+            ORDER BY time DESC
+            LIMIT :limit
+        `);
+
+        let rows = stmt.all({
+            user_id: userId,
+            network_id: networkId,
+            from_time: fromTime,
+            to_time: toTime,
+            limit: length || 50,
+        });
+
+        messagesTmr.stop();
+        return rows;
+    }
+
     async getMessagesFromMsgId(userId, networkId, buffer, fromMsgId, length) {
         let messagesTmr = this.stats.timerStart('lookup.time');
 
