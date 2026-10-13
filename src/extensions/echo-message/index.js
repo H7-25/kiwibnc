@@ -84,7 +84,8 @@ module.exports.init = async function init(hooks) {
 
                 if (!client.state.caps.has('echo-message') &&
                     (client.upstream.state.nick || '').toLowerCase() ===
-                    (message.nick || '').toLowerCase()) {
+                    (message.nick || '').toLowerCase() &&
+                    !client.upstream.isChannelName(message.params[0])) {
                     event.preventDefault();
                 }
             }

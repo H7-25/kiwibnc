@@ -262,8 +262,8 @@ commands.NOTICE = async function(msg, con) {
 
     // Send this message to other connected clients
     con.upstream && con.upstream.forEachClient((client) => {
-        if (!client.state.caps.has('echo-message') ||
-            con.upstream.state.caps.has('echo-message')) {
+        if (!con.upstream.isChannelName(msg.params[0]) &&
+            !client.state.caps.has('echo-message')) {
             return;
         }
 
@@ -299,8 +299,8 @@ commands.PRIVMSG = async function(msg, con) {
 
     // Send this message to other connected clients
     con.upstream && con.upstream.forEachClient((client) => {
-        if (!client.state.caps.has('echo-message') ||
-            con.upstream.state.caps.has('echo-message')) {
+        if (!con.upstream.isChannelName(msg.params[0]) &&
+            !client.state.caps.has('echo-message')) {
             return;
         }
 
