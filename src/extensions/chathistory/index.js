@@ -86,11 +86,14 @@ async function commandTargets(msg, con, messageDb) {
         return;
     }
 
+    let fromTime = dateToTs(fromRef.value);
+    let toTime = dateToTs(toRef.value);
+
     let targets = await messageDb.getTargets(
         con.state.authUserId,
         networkId,
-        dateToTs(fromRef.value),
-        dateToTs(toRef.value),
+        Math.min(fromTime, toTime),
+        Math.max(fromTime, toTime),
         paramLimit,
     );
 

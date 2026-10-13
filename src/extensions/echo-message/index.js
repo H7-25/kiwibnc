@@ -60,27 +60,33 @@ module.exports.init = async function init(hooks) {
             m.prefix = m.nick + '!' + m.username + '@' + m.hostname;
 
             upstream.forEachClient((client) => {
-                // Don't echo back to client that sent if it's not expecting it.
-                if(client === event.client && !event.client.state.caps.has('echo-message')) {
+                // The originating client receives an echo only if it negotiated echo-message.
+                // Other clients are handled by clientcommands.js.
+                if (client !== event.client ||
+                    !client.state.caps.has('echo-message')) {
                     return;
                 }
+
                 client.writeMsg(m);
             });
         }
     });
     hooks.on('message_to_client', (event) => {
-        // Disables normal bnc behavior of echoing a message to connected clients
-        if(!event.client.upstream) {
-            return;
-        }
-        let {client, message} = event;
-        if(message.command === 'PRIVMSG' || message.command === 'NOTICE' || message.command === 'TAGMSG') {
-            if (!client.state.caps.has('echo-message')
-            && (client.upstream.state.nick || '').toLowerCase() === (message.nick || '').toLowerCase()) {
-                event.preventDefault();
-            } else if(client.state.caps.has('echo-message') && message.source === 'client') {
-                event.preventDefault(); // Client and server support echo-message and msg came from a client, so ignore it.
+            if (!event.client.upstream) {
+                return;
             }
-        }
-    });
-};
+
+            let {client, message} = event;
+
+            if (message.command === 'PRIVMSG' ||
+                message.command === 'NOTICE' ||
+                message.command === 'TAGMSG') {
+
+                if (!client.state.caps.has('echo-message') &&
+                    (client.upstream.state.nick || '').toLowerCase() ===
+                    (message.nick || '').toLowerCase()) {
+                    event.preventDefault();
+                }
+            }
+        });
+    };
