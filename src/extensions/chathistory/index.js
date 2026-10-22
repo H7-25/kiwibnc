@@ -38,7 +38,9 @@ async function handleCommand(event) {
 
     let messages = [];
 
-    if (subCmd === 'BEFORE' || subCmd === 'AFTER') {
+    if (subCmd === 'TARGETS') {
+        return commandTargets(msg, con, messageDb);
+    } else if (subCmd === 'BEFORE' || subCmd === 'AFTER') {
         messages = await commandBeforeOrAfter(msg, con, messageDb);
     } else if (subCmd === 'LATEST') {
         messages = await commandLatest(msg, con, messageDb);
@@ -66,6 +68,62 @@ async function handleCommand(event) {
     }
 };
 
+async function commandTargets(msg, con, messageDb) {
+    let fromRef = parseReference(mParam(msg, 1, ''));
+    let toRef = parseReference(mParam(msg, 2, ''));
+    let paramLimit = parseLimit(mParam(msg, 3, ''), MAX_MESSAGES);
+
+    let networkId = con.state.authNetworkId;
+
+    if (fromRef.type !== 'timestamp' || toRef.type !== 'timestamp') {
+        con.writeMsg(
+            'FAIL',
+            'CHATHISTORY',
+            'NEED_MORE_PARAMS',
+            'TARGETS',
+            'Timestamps should be given',
+        );
+        return;
+    }
+
+    let fromTime = dateToTs(fromRef.value);
+    let toTime = dateToTs(toRef.value);
+
+    let targets = await messageDb.getTargets(
+        con.state.authUserId,
+        networkId,
+        Math.min(fromTime, toTime),
+        Math.max(fromTime, toTime),
+        paramLimit,
+    );
+
+    let batchId = Math.round(Math.random() * 1e17).toString(36);
+
+    let m = new Irc.Message(
+        'BATCH',
+        '+' + batchId,
+        'draft/chathistory-targets',
+    );
+    m.prefix = 'bnc';
+    con.writeMsg(m);
+
+    targets.forEach(target => {
+        m = new Irc.Message(
+            'CHATHISTORY',
+            'TARGETS',
+            target.buffer,
+            new Date(target.time).toISOString(),
+        );
+        m.prefix = 'bnc';
+        m.tags.batch = batchId;
+        con.writeMsg(m);
+    });
+
+    m = new Irc.Message('BATCH', '-' + batchId);
+    m.prefix = 'bnc';
+    con.writeMsg(m);
+}
+
 async function commandAround(msg, con, messageDb) {
     // TODO: implement this
     con.writeMsg(
@@ -84,6 +142,8 @@ async function commandBetween(msg, con, messageDb) {
     let toMsgRef = parseReference(mParam(msg, 3, ''));
     let paramLimit = parseLimit(mParam(msg, 4, ''), MAX_MESSAGES);
 
+    let networkId = con.state.authNetworkId;
+
     if (
         (fromMsgRef.type === 'timestamp' || fromMsgRef.type === 'msgid') &&
         (toMsgRef.type === 'timestamp' || toMsgRef.type === 'msgid')
@@ -97,7 +157,7 @@ async function commandBetween(msg, con, messageDb) {
         }
         messages = await messageDb.getMessagesBetween(
             con.state.authUserId,
-            con.state.authNetworkId,
+            networkId,
             target,
             fromMsgRef,
             toMsgRef,
@@ -123,13 +183,14 @@ async function commandLatest(msg, con, messageDb) {
     let rawRef = mParam(msg, 2, '');
     let msgRef = parseReference(rawRef);
     let paramLimit = parseLimit(mParam(msg, 3, ''), MAX_MESSAGES);
+    let networkId = con.state.authNetworkId;
 
     if (msgRef.type === 'timestamp') {
         if (rawRef === '*') {
             // '*' means no lower bound — return the last N messages
             messages = await messageDb.getMessagesBeforeTime(
                 con.state.authUserId,
-                con.state.authNetworkId,
+                networkId,
                 target,
                 Date.now(),
                 paramLimit,
@@ -139,7 +200,7 @@ async function commandLatest(msg, con, messageDb) {
             let ts = dateToTs(msgRef.value);
             messages = await messageDb.getMessagesFromTime(
                 con.state.authUserId,
-                con.state.authNetworkId,
+                networkId,
                 target,
                 ts,
                 paramLimit,
@@ -148,7 +209,7 @@ async function commandLatest(msg, con, messageDb) {
     } else if (msgRef.type === 'msgid') {
         messages = await messageDb.getMessagesFromMsgId(
             con.state.authUserId,
-            con.state.authNetworkId,
+            networkId,
             target,
             msgRef.value,
             paramLimit,
@@ -173,6 +234,7 @@ async function commandBeforeOrAfter(msg, con, messageDb) {
     let target = mParam(msg, 1, '');
     let msgRef = parseReference(mParam(msg, 2, ''));
     let paramLimit = parseLimit(mParam(msg, 3, ''), MAX_MESSAGES);
+    let networkId = con.state.authNetworkId;
 
     if (msgRef.type === 'timestamp') {
         let ts = dateToTs(msgRef.value);
@@ -180,7 +242,7 @@ async function commandBeforeOrAfter(msg, con, messageDb) {
         if (subCmd === 'AFTER') {
             messages = await messageDb.getMessagesFromTime(
                 con.state.authUserId,
-                con.state.authNetworkId,
+                networkId,
                 target,
                 ts,
                 paramLimit,
@@ -188,13 +250,12 @@ async function commandBeforeOrAfter(msg, con, messageDb) {
         } else if (subCmd === 'BEFORE') {
             messages = await messageDb.getMessagesBeforeTime(
                 con.state.authUserId,
-                con.state.authNetworkId,
+                networkId,
                 target,
                 ts,
                 paramLimit,
             );
         }
-
     } else if (msgRef.type === 'msgid') {
         // Pass the msgid through verbatim. It is matched against the stored
         // msgid column (a TEXT id), NOT a timestamp — running it through
@@ -207,7 +268,7 @@ async function commandBeforeOrAfter(msg, con, messageDb) {
         if (subCmd === 'AFTER') {
             messages = await messageDb.getMessagesFromMsgId(
                 con.state.authUserId,
-                con.state.authNetworkId,
+                networkId,
                 target,
                 msgid,
                 paramLimit,
@@ -215,13 +276,12 @@ async function commandBeforeOrAfter(msg, con, messageDb) {
         } else if (subCmd === 'BEFORE') {
             messages = await messageDb.getMessagesBeforeMsgId(
                 con.state.authUserId,
-                con.state.authNetworkId,
+                networkId,
                 target,
                 msgid,
                 paramLimit,
             );
         }
-
     } else {
         con.writeMsg(
             'FAIL',

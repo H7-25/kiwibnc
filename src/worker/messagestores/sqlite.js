@@ -125,6 +125,22 @@ class SqliteMessageStore {
             data BLOB UNIQUE
         )`);
 
+        /*
+         * Stores the latest message timestamp for each user/network/buffer.
+         * Used by IRCv3 CHATHISTORY TARGETS to avoid scanning the message history.
+         *
+         * Existing databases require a separate, one-time backfill.
+         */
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS chathistory_targets (
+                user_id INTEGER NOT NULL,
+                network_id INTEGER NOT NULL,
+                bufferref INTEGER NOT NULL,
+                last_time INTEGER NOT NULL,
+                PRIMARY KEY (user_id, network_id, bufferref)
+            )
+        `);
+
         this.stmtInsertData = this.db.prepare("INSERT INTO data(data) values(?)");
         this.stmtInsertLogWithId = this.db.prepare(`
             INSERT INTO logs (
@@ -141,6 +157,38 @@ class SqliteMessageStore {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         this.stmtGetExistingDataId = this.db.prepare("SELECT id FROM data WHERE data = ?");
+
+        this.stmtUpdateChathistoryTarget = this.db.prepare(`
+            INSERT INTO chathistory_targets (
+                user_id,
+                network_id,
+                bufferref,
+                last_time
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, network_id, bufferref)
+            DO UPDATE SET
+                last_time = MAX(last_time, excluded.last_time)
+        `);
+
+        this.stmtRefreshChathistoryTarget = this.db.prepare(`
+            UPDATE chathistory_targets
+            SET last_time = COALESCE((
+                SELECT MAX(time)
+                FROM logs
+                WHERE user_id = :user_id
+                  AND network_id = :network_id
+                  AND bufferref = :bufferref
+            ), -1)
+            WHERE user_id = :user_id
+              AND network_id = :network_id
+              AND bufferref = :bufferref
+              AND last_time <= :deleted_time
+        `);
+
+        this.stmtDeleteEmptyChathistoryTargets = this.db.prepare(`
+            DELETE FROM chathistory_targets
+            WHERE last_time = -1
+        `);
 
         if (this.retentionDaysChannels > 0 || this.retentionDaysPMs > 0) {
             const runCleanupTask = async () => {
@@ -242,6 +290,29 @@ class SqliteMessageStore {
                                 try {
                                     this.db.transaction(() => {
                                         rows = this.runRetentionCleanup(days, kind, BATCH_SIZE, tempBufs, emptyPrefixId);
+
+                                        // Recalculate the latest timestamp only for affected buffers.
+                                        const affectedTargets = new Map();
+
+                                        for (const row of rows) {
+                                            const key = `${row.user_id}:${row.network_id}:${row.bufferref}`;
+                                            const current = affectedTargets.get(key);
+
+                                            if (!current || row.time > current.deleted_time) {
+                                                affectedTargets.set(key, {
+                                                    user_id: row.user_id,
+                                                    network_id: row.network_id,
+                                                    bufferref: row.bufferref,
+                                                    deleted_time: row.time,
+                                                });
+                                            }
+                                        }
+
+                                        for (const target of affectedTargets.values()) {
+                                            this.stmtRefreshChathistoryTarget.run(target);
+                                        }
+
+                                        this.stmtDeleteEmptyChathistoryTargets.run();
                                     })();
                                     break;
                                 } catch (err) {
@@ -507,7 +578,8 @@ class SqliteMessageStore {
                     WHERE prefixref = ? AND time < ?
                     LIMIT ?
                 )
-                RETURNING bufferref, msgtagsref, dataref, prefixref, paramsref
+                RETURNING user_id, network_id, bufferref, time,
+                  msgtagsref, dataref, prefixref, paramsref
             `;
             params = [emptyPrefixId, cutoffTime, limit || 1000];
         } else if (bufTableName) {
@@ -521,7 +593,8 @@ class SqliteMessageStore {
                     WHERE l.time < ?
                     LIMIT ?
                 )
-                RETURNING bufferref, msgtagsref, dataref, prefixref, paramsref
+                RETURNING user_id, network_id, bufferref, time,
+                  msgtagsref, dataref, prefixref, paramsref
             `;
         } else if (isChannel) {
             sql = `
@@ -535,7 +608,8 @@ class SqliteMessageStore {
                     )
                     LIMIT ?
                 )
-                RETURNING bufferref, msgtagsref, dataref, prefixref, paramsref
+                RETURNING user_id, network_id, bufferref, time,
+                  msgtagsref, dataref, prefixref, paramsref
             `;
         } else {
             sql = `
@@ -549,7 +623,8 @@ class SqliteMessageStore {
                     )
                     LIMIT ?
                 )
-                RETURNING bufferref, msgtagsref, dataref, prefixref, paramsref
+                RETURNING user_id, network_id, bufferref, time,
+                  msgtagsref, dataref, prefixref, paramsref
             `;
         }
 
@@ -579,6 +654,36 @@ class SqliteMessageStore {
         }
 
         return null;
+    }
+
+    async getTargets(userId, networkId, fromTime, toTime, length) {
+        let messagesTmr = this.stats.timerStart('lookup.time');
+
+        let stmt = this.db.prepare(`
+            SELECT
+                d_buffer.data AS buffer,
+                targets.last_time AS time
+            FROM chathistory_targets targets
+            INNER JOIN data d_buffer ON targets.bufferref = d_buffer.id
+            WHERE
+                targets.user_id = :user_id
+                AND targets.network_id = :network_id
+                AND targets.last_time > :from_time
+                AND targets.last_time < :to_time
+            ORDER BY targets.last_time DESC
+            LIMIT :limit
+        `);
+
+        let rows = stmt.all({
+            user_id: userId,
+            network_id: networkId,
+            from_time: fromTime,
+            to_time: toTime,
+            limit: length || 50,
+        });
+
+        messagesTmr.stop();
+        return rows;
     }
 
     async getMessagesFromMsgId(userId, networkId, buffer, fromMsgId, length) {
@@ -962,6 +1067,13 @@ class SqliteMessageStore {
                     prefixId,
                     paramsId,
                 );
+
+                this.stmtUpdateChathistoryTarget.run(
+                    userId,
+                    networkId,
+                    bufferId,
+                    time.getTime(),
+                );
             })();
         } catch (err) {
             if (err.code === 'SQLITE_BUSY') {
@@ -998,7 +1110,10 @@ class SqliteMessageStore {
     }
 
     deleteUserMessages(userId) {
-        this.db.prepare('DELETE FROM logs WHERE user_id = ?').run(userId);
+        this.db.transaction(() => {
+            this.db.prepare('DELETE FROM logs WHERE user_id = ?').run(userId);
+            this.db.prepare('DELETE FROM chathistory_targets WHERE user_id = ?').run(userId);
+        })();
     }
 }
 

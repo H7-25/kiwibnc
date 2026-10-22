@@ -262,8 +262,14 @@ commands.NOTICE = async function(msg, con) {
 
     // Send this message to other connected clients
     con.upstream && con.upstream.forEachClient((client) => {
+        if (!con.upstream.isChannelName(msg.params[0]) &&
+            !client.state.caps.has('echo-message')) {
+            return;
+        }
+
         let m = new Message('NOTICE', msg.params[0], msg.params[1]);
         m.prefix = con.upstream.state.nick;
+        m.nick = con.upstream.state.nick;
         m.tags.msgid = msgId;
         m.source = 'client';
         client.writeMsg(m);
@@ -281,7 +287,9 @@ commands.NOTICE = async function(msg, con) {
     }
 
     // Ensure the buffer exists for outgoing notices to a user so other devices see it
-    if (con.upstream && !con.upstream.isChannelName(msg.params[0])) {
+    if (con.upstream && msg.params[0] &&
+        !con.upstream.isChannelName(msg.params[0]) &&
+        !/[:\s]/u.test(msg.params[0])) {
         con.upstream.state.getOrAddBuffer(msg.params[0], con.upstream);
     }
 
@@ -293,8 +301,14 @@ commands.PRIVMSG = async function(msg, con) {
 
     // Send this message to other connected clients
     con.upstream && con.upstream.forEachClient((client) => {
+        if (!con.upstream.isChannelName(msg.params[0]) &&
+            !client.state.caps.has('echo-message')) {
+            return;
+        }
+
         let m = new Message('PRIVMSG', msg.params[0], msg.params[1]);
         m.prefix = con.upstream.state.nick;
+        m.nick = con.upstream.state.nick;
         m.tags.msgid = msgId;
         m.source = 'client';
         client.writeMsg(m);
@@ -320,7 +334,9 @@ commands.PRIVMSG = async function(msg, con) {
     // Ensure the buffer exists for outgoing PMs so other devices see the conversation.
     // The server won't echo the message back (no echo-message cap), so upstreamcommands
     // won't create it for us.
-    if (con.upstream && msg.params[0] !== '*bnc' && !con.upstream.isChannelName(msg.params[0])) {
+    if (con.upstream && msg.params[0] !== '*bnc' &&
+        !con.upstream.isChannelName(msg.params[0]) &&
+        !/[:\s]/u.test(msg.params[0])) {
         con.upstream.state.getOrAddBuffer(msg.params[0], con.upstream);
     }
 
