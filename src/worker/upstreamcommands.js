@@ -522,9 +522,9 @@ commands.NOTICE = async function(msg, con) {
         await con.messages.storeMessage(msg, con, null);
     }
 
-    // Some notices come from the server without a nick.
-    // Don't create buffers for malformed private message targets.
-    if (bufferName && !/[:\s]/u.test(bufferName)) {
+    // Only create buffers for channel notices.
+    // Private notices are stored in history without opening a private buffer.
+    if (bufferName && con.isChannelName(bufferName) && !/[:\s]/u.test(bufferName)) {
         con.state.getOrAddBuffer(bufferName, con);
     }
 };
