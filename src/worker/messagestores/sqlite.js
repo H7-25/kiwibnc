@@ -61,8 +61,12 @@ class SqliteMessageStore {
         this.cleanupRunning = false;
         this.vacuumRunning = false;
 
+        this.dataCacheHits = 0;
+        this.dataCacheMisses = 0;
         this.dataCache = new LRU({
-            max: 50 * 1000 * 1000, // very roughly 50mb cache
+            // Budget in key code units, NOT resident bytes: LRU/Map entries,
+            // numeric IDs and string representation add implementation overhead.
+            max: 50 * 1000 * 1000,
             length: (entry, key) => key.length,
         });
     }
@@ -382,6 +386,13 @@ class SqliteMessageStore {
             }
             this.stats.gauge('retention.cleanup.rows_deleted', Object.values(counts).reduce((sum, n) => sum + n, 0));
             await this.runVacuum();
+            const cache = this.getDataCacheStats();
+            l.info(
+                `SQLite dataCache: ${cache.itemCount} entries, ` +
+                `${cache.hits} hits, ${cache.misses} misses, ` +
+                `hit rate ${cache.hitRate === null ? 'N/A' : (cache.hitRate * 100).toFixed(1) + '%'}, ` +
+                `${cache.keyCodeUnits}/${cache.maxKeyCodeUnits} key units`
+            );
             return counts;
         } catch (err) {
             l.error('Error running retention cleanup', err);
@@ -398,8 +409,10 @@ class SqliteMessageStore {
     dataId(data) {
         let cached = this.dataCache.get(data);
         if (cached) {
+            this.dataCacheHits++;
             return cached;
         }
+        this.dataCacheMisses++;
 
         try {
             // Will fail if the data already exists in the db
@@ -414,6 +427,21 @@ class SqliteMessageStore {
         }
 
         return null;
+    }
+
+    // Constant-time, on-demand diagnostics. No timers, SQL, cache enumeration
+    // or change to eviction policy. Sample counter deltas for interval hit rate.
+    getDataCacheStats() {
+        const lookups = this.dataCacheHits + this.dataCacheMisses;
+        return {
+            hits: this.dataCacheHits,
+            misses: this.dataCacheMisses,
+            hitRate: lookups ? this.dataCacheHits / lookups : null,
+            itemCount: this.dataCache.itemCount,
+            keyCodeUnits: this.dataCache.length,
+            maxKeyCodeUnits: this.dataCache.max,
+            utf16PayloadBytes: this.dataCache.length * 2,
+        };
     }
 
     async getTargets(userId, networkId, fromTime, toTime, length) {

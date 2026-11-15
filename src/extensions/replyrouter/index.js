@@ -24,11 +24,10 @@ module.exports.init = function init(hooks) {
         event.clients.forEach(client => {
             let expecting = client.state.tempGet('expecting_replies') || [];
     
-            for (let i = 0; i < expecting.length; i++) {
-                if (expecting[i].replies.find(reply => reply.cmd === command)) {
-                    clientsExpectingMsg.push(client);
-                }
-            } 
+            // Multiple outstanding requests must not duplicate the recipient.
+            if (expecting.some(route => route.replies.some(reply => reply.cmd === command))) {
+                clientsExpectingMsg.push(client);
+            }
         });
     
         if (clientsExpectingMsg.length === 0) {
@@ -68,10 +67,37 @@ module.exports.init = function init(hooks) {
         if (!expectReplies) {
             return;
         }
+
+        // NAMES with a target is answered by clientcommands locally, including
+        // unknown buffers and disconnected networks. No upstream reply is due.
+        if (msg.command.toUpperCase() === 'NAMES' && (msg.params[0] || '')) return;
+        const upstream = client.upstream;
+        if (!upstream || !upstream.state.connected) return;
     
         let expecting = client.state.tempGet('expecting_replies') || [];
         expecting.push({command: msg.command.toUpperCase(), replies: expectReplies, added: Date.now()});
         l.debug('Client now expecting one of', expectReplies.map(r=>r.cmd).join(' '));
         client.state.tempSet('expecting_replies', expecting);
+    });
+
+    // Bare NAMES is forwarded, but upstreamcommands consumes 353/366 and
+    // synthesizes NAMES for clients. Its ending never reaches message_to_clients.
+    hooks.on('message_from_upstream', event => {
+        if (event.message.command !== '366') return;
+        event.client.forEachClient(client => {
+            const expecting = client.state.tempGet('expecting_replies');
+            if (!expecting || !expecting.some(route => route.command === 'NAMES')) return;
+            const remaining = expecting.filter(route => route.command !== 'NAMES');
+            client.state.tempSet('expecting_replies', remaining.length ? remaining : null);
+        });
+    });
+
+    // Replies to requests on the old IRC connection cannot arrive after close.
+    hooks.on('connection_close', event => {
+        event.upstream.forEachClient(client => {
+            if (client.state.tempGet('expecting_replies')) {
+                client.state.tempSet('expecting_replies', null);
+            }
+        });
     });
 }
