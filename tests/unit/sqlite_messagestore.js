@@ -96,7 +96,9 @@ describe('SqliteMessageStore Retention & Cleanup', () => {
     };
 
     describe('runRetentionCleanup', () => {
-        test('should delete channel messages older than retention days', () => {
+        test('should delete channel messages older than retention days', async () => {
+            store.retentionDaysPMs = 0;
+            store.retentionDaysServer = 0;
             const channelId = insertData('#channel');
             const oldTime = Date.now() - (31 * 24 * 60 * 60 * 1000); // 31 days ago
             const newTime = Date.now() - (1 * 24 * 60 * 60 * 1000); // 1 day ago
@@ -104,39 +106,42 @@ describe('SqliteMessageStore Retention & Cleanup', () => {
             insertLog({ bufferref: channelId, time: oldTime, msgid: 'old1' });
             insertLog({ bufferref: channelId, time: newTime, msgid: 'new1' });
 
-            const deleted = store.runRetentionCleanup(30, 'channels', 100);
+            const deleted = await store.runRetentionCleanup({ pause: () => Promise.resolve(), throwOnError: true });
 
-            expect(deleted.length).toBe(1);
-            expect(deleted[0].bufferref).toBe(channelId);
+            expect(deleted.channels).toBe(1);
 
             const remaining = store.db.prepare('SELECT * FROM logs').all();
             expect(remaining.length).toBe(1);
             expect(remaining[0].msgid).toBe('new1');
         });
 
-        test('should NOT delete PM messages when cleaning channels', () => {
+        test('should NOT delete PM messages when cleaning channels', async () => {
+            store.retentionDaysPMs = 0;
+            store.retentionDaysServer = 0;
             const pmId = insertData('user1');
             const oldTime = Date.now() - (31 * 24 * 60 * 60 * 1000);
 
             insertLog({ bufferref: pmId, time: oldTime, msgid: 'pm1' });
 
-            const deleted = store.runRetentionCleanup(30, 'channels', 100);
+            const deleted = await store.runRetentionCleanup({ pause: () => Promise.resolve(), throwOnError: true });
 
-            expect(deleted.length).toBe(0);
+            expect(deleted.channels).toBe(0);
             
             const remaining = store.db.prepare('SELECT * FROM logs').all();
             expect(remaining.length).toBe(1);
         });
 
-        test('should delete PM messages older than retention days', () => {
+        test('should delete PM messages older than retention days', async () => {
+            store.retentionDaysChannels = 0;
+            store.retentionDaysServer = 0;
             const pmId = insertData('user1');
             const oldTime = Date.now() - (31 * 24 * 60 * 60 * 1000);
 
             insertLog({ bufferref: pmId, time: oldTime, msgid: 'pm1' });
 
-            const deleted = store.runRetentionCleanup(30, 'pms', 100);
+            const deleted = await store.runRetentionCleanup({ pause: () => Promise.resolve(), throwOnError: true });
 
-            expect(deleted.length).toBe(1);
+            expect(deleted.pms).toBe(1);
         });
     });
 

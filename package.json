@@ -39,6 +39,7 @@
   },
   "scripts": {
     "test": "jest",
+    "test:retention": "node --test tests/retention/retention.test.js",
     "start": "node src/server.js"
   },
   "bin": {

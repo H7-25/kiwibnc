@@ -4,6 +4,7 @@ const sqlite3 = require('better-sqlite3');
 const LRU = require('lru-cache');
 const Stats = require('../../libs/stats');
 const Helpers = require('../../libs/helpers');
+const SqliteRetention = require('./sqlite-retention');
 
 const IrcMessage = require('irc-framework').Message;
 
@@ -185,196 +186,8 @@ class SqliteMessageStore {
               AND last_time <= :deleted_time
         `);
 
-        this.stmtDeleteEmptyChathistoryTargets = this.db.prepare(`
-            DELETE FROM chathistory_targets
-            WHERE last_time = -1
-        `);
-
-        if (this.retentionDaysChannels > 0 || this.retentionDaysPMs > 0) {
-            const runCleanupTask = async () => {
-                if (this.cleanupRunning) return;
-                this.cleanupRunning = true;
-                l.info('Running message retention cleanup');
-                let startTime = Date.now();
-                let totalDeleted = 0;
-                this.stats.increment('retention.cleanup.runs');
-
-                try {
-                    const BATCH_SIZE = 150;
-
-                    // Orphaned 'data' ids are collected in a Set and flushed as soon as there are
-                    // enough of them for a full chunk, rather than accumulating every deleted row
-                    // until the end of the run: a catch-up pass over millions of messages would
-                    // otherwise hold the whole lot in memory at once.
-                    //
-                    // Flushing mid-run stays correct because an id is only dropped from the Set
-                    // once checked, and the *last* logs row referencing it re-adds it when deleted,
-                    // so every id gets a final check after its last reference is gone.
-                    const DATA_CLEANUP_CHUNK = 900;
-                    let pendingDataIds = new Set();
-
-                    const flushDataCleanup = async (force) => {
-                        while (pendingDataIds.size >= (force ? 1 : DATA_CLEANUP_CHUNK)) {
-                            let chunk = [];
-                            for (let id of pendingDataIds) {
-                                chunk.push(id);
-                                if (chunk.length >= DATA_CLEANUP_CHUNK) break;
-                            }
-                            chunk.forEach((id) => pendingDataIds.delete(id));
-
-                            try {
-                                this.cleanupOrphanedData(chunk);
-                            } catch (cleanupErr) {
-                                l.warn('Data cleanup failed, will retry next cycle', cleanupErr.message);
-                            }
-                            // These NOT EXISTS queries are synchronous, yield between chunks
-                            await new Promise(resolve => setTimeout(resolve, 50));
-                        }
-                    };
-
-                    const processRetention = async (days, kind) => {
-                        if (days <= 0) return;
-                        let more = true;
-                        let busyRetries = 0;
-                        const isChannel = kind === 'channels';
-
-                        // The server tab is matched on prefixref, which is indexed, so it needs
-                        // none of the temp table machinery below
-                        let emptyPrefixId = null;
-                        if (kind === 'server') {
-                            let row = this.db.prepare("SELECT id FROM data WHERE data = ''").get();
-                            if (!row) {
-                                return;
-                            }
-                            emptyPrefixId = row.id;
-                        }
-
-                        // Pre-compute the set of matching buffer IDs ONCE into a temp table.
-                        //
-                        // Without this, runRetentionCleanup's IN-subquery runs a full table scan
-                        // of the 'data' table on every batch call. The 'data' column has BLOB
-                        // affinity, so SQLite cannot use the UNIQUE index for LIKE comparisons
-                        // (LIKE index optimisation only applies to TEXT affinity columns). On a
-                        // large database the scan takes several seconds and blocks the event loop
-                        // for the entire duration, stalling HTTP requests and IRC keepalives.
-                        const tempBufs = kind === 'server'
-                            ? null
-                            : (isChannel ? 'tmp_ret_ch_bufs' : 'tmp_ret_pm_bufs');
-                        if (tempBufs) {
-                            this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
-                            const bufSql = isChannel
-                                ? `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) LIKE '#%' OR CAST(data AS TEXT) LIKE '&%'`
-                                : `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) NOT LIKE '#%' AND CAST(data AS TEXT) NOT LIKE '&%'`;
-                            this.db.exec(bufSql);
-                            this.db.exec(`CREATE INDEX idx_${tempBufs} ON ${tempBufs}(id)`);
-                        }
-
-                        while (more) {
-                            // If a transaction is currently open (e.g. from storeMessageLoop), wait
-                            // until it completes to avoid nested transactions or locking issues.
-                            if (this.db.inTransaction) {
-                                if (busyRetries++ > 50) { // Wait max 5 seconds
-                                    l.warn('Database busy with other transactions, aborting retention cleanup');
-                                    if (tempBufs) this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
-                                    return;
-                                }
-                                await new Promise(resolve => setTimeout(resolve, 100));
-                                continue;
-                            }
-                            busyRetries = 0;
-
-                            let rows = [];
-                            // Transaction for the delete batch — retry on SQLITE_BUSY
-                            let retentionRetries = 0;
-                            while (true) {
-                                try {
-                                    this.db.transaction(() => {
-                                        rows = this.runRetentionCleanup(days, kind, BATCH_SIZE, tempBufs, emptyPrefixId);
-
-                                        // Recalculate the latest timestamp only for affected buffers.
-                                        const affectedTargets = new Map();
-
-                                        for (const row of rows) {
-                                            const key = `${row.user_id}:${row.network_id}:${row.bufferref}`;
-                                            const current = affectedTargets.get(key);
-
-                                            if (!current || row.time > current.deleted_time) {
-                                                affectedTargets.set(key, {
-                                                    user_id: row.user_id,
-                                                    network_id: row.network_id,
-                                                    bufferref: row.bufferref,
-                                                    deleted_time: row.time,
-                                                });
-                                            }
-                                        }
-
-                                        for (const target of affectedTargets.values()) {
-                                            this.stmtRefreshChathistoryTarget.run(target);
-                                        }
-
-                                        this.stmtDeleteEmptyChathistoryTargets.run();
-                                    })();
-                                    break;
-                                } catch (err) {
-                                    if (err.code === 'SQLITE_BUSY' && retentionRetries++ < 10) {
-                                        await new Promise(resolve => setTimeout(resolve, 200));
-                                        continue;
-                                    }
-                                    throw err;
-                                }
-                            }
-
-                            if (rows.length > 0) {
-                                for (let row of rows) {
-                                    if (row.bufferref) pendingDataIds.add(row.bufferref);
-                                    if (row.msgtagsref) pendingDataIds.add(row.msgtagsref);
-                                    if (row.dataref) pendingDataIds.add(row.dataref);
-                                    if (row.prefixref) pendingDataIds.add(row.prefixref);
-                                    if (row.paramsref) pendingDataIds.add(row.paramsref);
-                                }
-                                totalDeleted += rows.length;
-                                // Yield to event loop between batches so TCP keepalives,
-                                // reconnections and other I/O can be processed.
-                                // Without this delay, continuous synchronous SQLite writes
-                                // starve the event loop and cause IRC connection timeouts.
-                                await new Promise(resolve => setTimeout(resolve, 50));
-                                await flushDataCleanup(false);
-                            }
-
-                            if (rows.length < BATCH_SIZE) {
-                                more = false;
-                            }
-                        }
-
-                        if (tempBufs) this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
-                    };
-
-                    if (this.retentionDaysChannels > 0) {
-                        await processRetention(this.retentionDaysChannels, 'channels');
-                    }
-                    // Before the PM pass, so the PM temp table has less to walk
-                    if (this.retentionDaysServer > 0) {
-                        await processRetention(this.retentionDaysServer, 'server');
-                    }
-                    if (this.retentionDaysPMs > 0) {
-                        await processRetention(this.retentionDaysPMs, 'pms');
-                    }
-
-                    // Anything left over from the last partial chunk
-                    await flushDataCleanup(true);
-
-                    // Deleting rows only moves pages onto the freelist, it never shrinks the file
-                    await this.runVacuum();
-
-                    this.stats.gauge('retention.cleanup.rows_deleted', totalDeleted);
-                    this.stats.gauge('retention.cleanup.duration_ms', Date.now() - startTime);
-                } catch (err) {
-                    l.error('Error running retention cleanup', err);
-                    this.stats.increment('retention.cleanup.errors');
-                } finally {
-                    this.cleanupRunning = false;
-                }
-            };
+        if (this.retentionDaysChannels > 0 || this.retentionDaysPMs > 0 || this.retentionDaysServer > 0) {
+            const runCleanupTask = () => this.runRetentionCleanup();
 
             // Delay the first pass rather than running it during startup, when every client is
             // reconnecting and requesting history
@@ -552,86 +365,33 @@ class SqliteMessageStore {
     }
 
     /**
-     * Deletes messages exceeding the retention period
-     * @param {number} days - Number of retention days
-     * @param {boolean} isChannel - true for channels (#, &), false for PMs
-     * @param {number} limit - Max number of rows to delete per batch
-     * @returns {Array} Deleted rows with their references
+     * Incremental retention. The scanner never materializes the global data
+     * dictionary, and commits deletion, TARGETS and orphan cleanup together.
      */
-    runRetentionCleanup(days, kind, limit, bufTableName, emptyPrefixId) {
-        if (days <= 0) return [];
-
-        const isChannel = kind === 'channels';
-        let cutoffDate = new Date();
-        cutoffDate.setDate(cutoffDate.getDate() - days);
-        let cutoffTime = cutoffDate.getTime();
-
-        let sql;
-        let params = [cutoffTime, limit || 1000];
-        if (kind === 'server') {
-            // A message with no sender is server output, never a conversation. Matching on
-            // prefixref uses logs_prefixref, so this needs no temp table of buffer ids.
-            sql = `
-                DELETE FROM logs
-                WHERE rowid IN (
-                    SELECT rowid FROM logs
-                    WHERE prefixref = ? AND time < ?
-                    LIMIT ?
-                )
-                RETURNING user_id, network_id, bufferref, time,
-                  msgtagsref, dataref, prefixref, paramsref
-            `;
-            params = [emptyPrefixId, cutoffTime, limit || 1000];
-        } else if (bufTableName) {
-            // Use the pre-computed temp table of buffer IDs (avoids repeated full table
-            // scan of the data column which has BLOB affinity and cannot use LIKE index).
-            sql = `
-                DELETE FROM logs
-                WHERE rowid IN (
-                    SELECT l.rowid FROM logs l
-                    INNER JOIN ${bufTableName} b ON l.bufferref = b.id
-                    WHERE l.time < ?
-                    LIMIT ?
-                )
-                RETURNING user_id, network_id, bufferref, time,
-                  msgtagsref, dataref, prefixref, paramsref
-            `;
-        } else if (isChannel) {
-            sql = `
-                DELETE FROM logs
-                WHERE rowid IN (
-                    SELECT rowid FROM logs
-                    WHERE time < ?
-                    AND bufferref IN (
-                        SELECT id FROM data
-                        WHERE data LIKE '#%' OR data LIKE '&%'
-                    )
-                    LIMIT ?
-                )
-                RETURNING user_id, network_id, bufferref, time,
-                  msgtagsref, dataref, prefixref, paramsref
-            `;
-        } else {
-            sql = `
-                DELETE FROM logs
-                WHERE rowid IN (
-                    SELECT rowid FROM logs
-                    WHERE time < ?
-                    AND bufferref IN (
-                        SELECT id FROM data
-                        WHERE data NOT LIKE '#%' AND data NOT LIKE '&%'
-                    )
-                    LIMIT ?
-                )
-                RETURNING user_id, network_id, bufferref, time,
-                  msgtagsref, dataref, prefixref, paramsref
-            `;
+    async runRetentionCleanup(options = {}) {
+        if (this.cleanupRunning) return;
+        this.cleanupRunning = true;
+        const started = Date.now();
+        l.info('Running message retention cleanup');
+        this.stats.increment('retention.cleanup.runs');
+        try {
+            const counts = await new SqliteRetention(this, options).run();
+            for (const [kind, count] of Object.entries(counts)) {
+                this.stats.gauge(`retention.cleanup.${kind}.rows_deleted`, count);
+                l.info(`Retention cleanup completed (${kind}): ${count} messages removed`);
+            }
+            this.stats.gauge('retention.cleanup.rows_deleted', Object.values(counts).reduce((sum, n) => sum + n, 0));
+            await this.runVacuum();
+            return counts;
+        } catch (err) {
+            l.error('Error running retention cleanup', err);
+            this.stats.increment('retention.cleanup.errors');
+            // Callers can test/retry failures; scheduled tasks log them here only.
+            if (options.throwOnError) throw err;
+        } finally {
+            this.stats.gauge('retention.cleanup.duration_ms', Date.now() - started);
+            this.cleanupRunning = false;
         }
-
-        let label = kind === 'channels' ? 'channels' : kind === 'server' ? 'server tab' : 'PMs';
-        let rows = this.db.prepare(sql).all(...params);
-        l.info(`Retention cleanup (${label}, >${days} days) removed ${rows.length} messages`);
-        return rows;
     }
 
     // Insert a chunk of data into the data table if it doesn't already exist, returning its ID
