@@ -203,9 +203,9 @@ class Users {
     }
 
     async changeUserPassword(id, password) {
-        let user = await this.db.factories.User.query().where('id', id);
+        let user = await this.db.factories.User.query().where('id', id).first();
         if (!user) {
-            return;
+            throw new Error('User not found');
         }
 
         user.password = password;
